@@ -84,31 +84,46 @@ class TranscriberWorker(threading.Thread):
             if device == "cpu" and self.use_gpu:
                 self.on_progress("No se detectó GPU compatible. Usando CPU...")
 
-            model = WhisperModel(self.model_size, device=device, compute_type=compute_type)
+            def run_pass(dev, ctype):
+                m = WhisperModel(self.model_size, device=dev, compute_type=ctype)
+                self.on_progress(f"Transcribiendo en {dev.upper()}... esto puede tardar unos minutos.")
+                segs, inf = m.transcribe(
+                    self.filepath,
+                    language=self.language,
+                    vad_filter=True,
+                )
+                out_txt, out_srt, out_plain = [], [], []
+                for i, seg in enumerate(segs, start=1):
+                    start = format_timestamp_txt(seg.start)
+                    end = format_timestamp_txt(seg.end)
+                    out_txt.append(f"[{start} --> {end}] {seg.text.strip()}")
+                    out_plain.append(seg.text.strip())
 
-            self.on_progress(f"Transcribiendo en {device.upper()}... esto puede tardar unos minutos.")
+                    srt_start = format_timestamp_srt(seg.start)
+                    srt_end = format_timestamp_srt(seg.end)
+                    out_srt.append(f"{i}\n{srt_start} --> {srt_end}\n{seg.text.strip()}\n")
 
-            segments, info = model.transcribe(
-                self.filepath,
-                language=self.language,
-                vad_filter=True,
-            )
+                    self.on_progress(f"Procesado segmento {i} ({start})...")
+                return inf, out_txt, out_srt, out_plain
 
-            lines_txt = []
-            lines_srt = []
-            plain_text = []
-
-            for i, seg in enumerate(segments, start=1):
-                start = format_timestamp_txt(seg.start)
-                end = format_timestamp_txt(seg.end)
-                lines_txt.append(f"[{start} --> {end}] {seg.text.strip()}")
-                plain_text.append(seg.text.strip())
-
-                srt_start = format_timestamp_srt(seg.start)
-                srt_end = format_timestamp_srt(seg.end)
-                lines_srt.append(f"{i}\n{srt_start} --> {srt_end}\n{seg.text.strip()}\n")
-
-                self.on_progress(f"Procesado segmento {i} ({start})...")
+            try:
+                info, lines_txt, lines_srt, plain_text = run_pass(device, compute_type)
+            except Exception as gpu_err:
+                error_text = str(gpu_err).lower()
+                gpu_related = any(
+                    kw in error_text
+                    for kw in ("cublas", "cudnn", "cuda", "dll", "library")
+                )
+                if device == "cuda" and gpu_related:
+                    self.on_progress(
+                        "La GPU falló al cargar librerías CUDA/cuDNN "
+                        "(probablemente falta el CUDA Toolkit). "
+                        "Reintentando automáticamente en CPU..."
+                    )
+                    device, compute_type = "cpu", "int8"
+                    info, lines_txt, lines_srt, plain_text = run_pass(device, compute_type)
+                else:
+                    raise
 
             base_name = Path(self.filepath).stem
             out_dir = Path(self.out_dir)
