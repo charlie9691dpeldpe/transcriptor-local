@@ -1,6 +1,8 @@
 """
 Transcriptor de Audio Local - GUI estilo Claude (con modo claro/oscuro)
-Usa faster-whisper para transcribir audio/video localmente, con GPU (CUDA) o CPU.
+Usa Whisper (OpenAI) + PyTorch para transcribir localmente, con GPU (CUDA) o CPU.
+PyTorch trae su propio runtime CUDA embebido, no requiere CUDA Toolkit/cuDNN
+instalados por separado en el sistema.
 """
 
 import os
@@ -63,6 +65,17 @@ MODEL_OPTIONS = ["tiny", "base", "small", "medium", "large-v3"]
 # --------------------------------------------------------------------------
 
 class TranscriberWorker(threading.Thread):
+    """
+    Motor de transcripción basado en el Whisper original de OpenAI + PyTorch.
+    PyTorch trae su propio runtime de CUDA embebido en el paquete, por lo que
+    NO requiere tener el CUDA Toolkit / cuDNN instalados por separado en el
+    sistema — solo el driver de NVIDIA normal, el más reciente que ya tengas.
+
+    Nota: es más lento que la versión basada en ctranslate2/faster-whisper,
+    pero es compatible con versiones de CUDA más nuevas (12, 13, etc.) sin
+    depender de que esa librería externa ya las soporte.
+    """
+
     def __init__(self, filepath, model_size, language, use_gpu, out_dir,
                  on_status, on_segment, on_progress_pct, on_done, on_error):
         super().__init__(daemon=True)
@@ -79,25 +92,17 @@ class TranscriberWorker(threading.Thread):
 
     def run(self):
         try:
-            self.on_status("Cargando modelo (puede tardar la primera vez)...")
-            from faster_whisper import WhisperModel
+            self.on_status("Cargando motor de transcripción (Whisper + PyTorch)...")
+            import whisper
+            import torch
+            import whisper.transcribe as whisper_transcribe_module
 
             device = "cpu"
-            compute_type = "int8"
-
             if self.use_gpu:
-                try:
-                    import ctranslate2
-                    supported = ctranslate2.get_supported_compute_types("cuda")
-                    if supported:
-                        device = "cuda"
-                        compute_type = "float16" if "float16" in supported else supported[0]
-                except Exception:
-                    device = "cpu"
-                    compute_type = "int8"
-
-            if device == "cpu" and self.use_gpu:
-                self.on_status("No se detectó GPU compatible. Usando CPU...")
+                if torch.cuda.is_available():
+                    device = "cuda"
+                else:
+                    self.on_status("No se detectó GPU compatible. Usando CPU...")
 
             if getattr(sys, "frozen", False):
                 base_dir = Path(sys.executable).parent
@@ -106,43 +111,70 @@ class TranscriberWorker(threading.Thread):
             models_dir = str(base_dir / "models")
             os.makedirs(models_dir, exist_ok=True)
 
-            def run_pass(dev, ctype):
-                m = WhisperModel(self.model_size, device=dev, compute_type=ctype,
-                                  download_root=models_dir)
-                self.on_status(f"Transcribiendo en {dev.upper()}...")
-                segs, inf = m.transcribe(self.filepath, language=self.language, vad_filter=True)
-                total_duration = getattr(inf, "duration", None) or 0
+            outer_self = self
+
+            class _ProgressBridge:
+                """Reemplaza la barra tqdm interna de whisper para reportar % real."""
+                def __init__(self, total=0, unit=None, disable=False, **kwargs):
+                    self.total = total or 1
+                    self.n = 0
+
+                def update(self, n):
+                    self.n += n
+                    pct = min(100, int(self.n / self.total * 100))
+                    outer_self.on_progress_pct(pct)
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+                def close(self):
+                    pass
+
+            whisper_transcribe_module.tqdm.tqdm = _ProgressBridge
+
+            def run_pass(dev):
+                self.on_status(f"Cargando modelo '{self.model_size}' en {dev.upper()}...")
+                m = whisper.load_model(self.model_size, device=dev, download_root=models_dir)
+                self.on_status(f"Transcribiendo en {dev.upper()}... esto puede tardar unos minutos.")
+                result = m.transcribe(
+                    self.filepath,
+                    language=self.language,
+                    fp16=(dev == "cuda"),
+                    verbose=False,
+                )
+                segs = result.get("segments", [])
                 out_txt, out_srt, out_plain = [], [], []
                 for i, seg in enumerate(segs, start=1):
-                    start = format_timestamp_txt(seg.start)
-                    end = format_timestamp_txt(seg.end)
-                    text = seg.text.strip()
+                    start = format_timestamp_txt(seg["start"])
+                    end = format_timestamp_txt(seg["end"])
+                    text = seg["text"].strip()
                     out_txt.append(f"[{start} --> {end}] {text}")
                     out_plain.append(text)
 
-                    srt_start = format_timestamp_srt(seg.start)
-                    srt_end = format_timestamp_srt(seg.end)
+                    srt_start = format_timestamp_srt(seg["start"])
+                    srt_end = format_timestamp_srt(seg["end"])
                     out_srt.append(f"{i}\n{srt_start} --> {srt_end}\n{text}\n")
 
-                    pct = 0
-                    if total_duration > 0:
-                        pct = min(100, round((seg.end / total_duration) * 100))
                     self.on_segment(text, start, end)
-                    self.on_progress_pct(pct)
-                return inf, out_txt, out_srt, out_plain
+                return result.get("language", self.language), out_txt, out_srt, out_plain
 
             try:
-                info, lines_txt, lines_srt, plain_text = run_pass(device, compute_type)
+                detected_lang, lines_txt, lines_srt, plain_text = run_pass(device)
             except Exception as gpu_err:
                 error_text = str(gpu_err).lower()
-                gpu_related = any(kw in error_text for kw in ("cublas", "cudnn", "cuda", "dll", "library"))
+                gpu_related = any(
+                    kw in error_text for kw in ("cuda", "dll", "library", "driver", "gpu")
+                )
                 if device == "cuda" and gpu_related:
                     self.on_status(
-                        "La GPU falló al cargar librerías CUDA/cuDNN "
-                        "(probablemente falta el CUDA Toolkit). Reintentando en CPU..."
+                        "La GPU falló al procesar (revisa que el driver esté al día). "
+                        "Reintentando automáticamente en CPU..."
                     )
-                    device, compute_type = "cpu", "int8"
-                    info, lines_txt, lines_srt, plain_text = run_pass(device, compute_type)
+                    device = "cpu"
+                    detected_lang, lines_txt, lines_srt, plain_text = run_pass(device)
                 else:
                     raise
 
@@ -157,10 +189,9 @@ class TranscriberWorker(threading.Thread):
             txt_path.write_text("\n".join(lines_txt), encoding="utf-8")
             srt_path.write_text("\n".join(lines_srt), encoding="utf-8")
 
-            detected_lang = getattr(info, "language", self.language or "desconocido")
             md_content = (
                 f"# Transcripción: {base_name}\n\n"
-                f"- Idioma detectado/usado: {detected_lang}\n"
+                f"- Idioma detectado/usado: {detected_lang or 'desconocido'}\n"
                 f"- Modelo: {self.model_size}\n\n"
                 f"## Texto completo\n\n{' '.join(plain_text)}\n"
             )
@@ -171,10 +202,6 @@ class TranscriberWorker(threading.Thread):
         except Exception as e:
             self.on_error(f"{e}\n\n{traceback.format_exc()}")
 
-
-# --------------------------------------------------------------------------
-# Boton con esquinas redondeadas, re-tematizable
-# --------------------------------------------------------------------------
 
 class RoundedButton(tk.Canvas):
     def __init__(self, parent, text, command, colors, panel_bg,
