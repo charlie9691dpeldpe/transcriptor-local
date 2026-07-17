@@ -1,10 +1,10 @@
 """
-Transcriptor de Audio Local - GUI
+Transcriptor de Audio Local - GUI estilo Claude
 Usa faster-whisper para transcribir audio/video localmente, con GPU (CUDA) o CPU.
+Panel dividido: transcripcion en vivo (editable) + controles.
 """
 
 import os
-import sys
 import threading
 import traceback
 from datetime import timedelta
@@ -13,7 +13,21 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-APP_TITLE = "Transcriptor Local (Whisper)"
+APP_TITLE = "Transcriptor Local"
+
+# --------------------------------------------------------------------------
+# Paleta estilo Claude
+# --------------------------------------------------------------------------
+BG = "#FAF9F5"          # crema de fondo
+PANEL = "#FFFFFF"       # panel blanco
+BORDER = "#E5E4DF"      # bordes suaves
+TEXT = "#3D3929"        # texto principal
+TEXT_MUTED = "#87867F"  # texto secundario
+ACCENT = "#D97757"      # coral / naranja Claude
+ACCENT_HOVER = "#C4633F"
+TRACK = "#EDEBE3"       # fondo de barra de progreso
+
+FONT_FAMILY = "Segoe UI"
 
 # --------------------------------------------------------------------------
 # Utilidades de formato
@@ -51,20 +65,22 @@ MODEL_OPTIONS = ["tiny", "base", "small", "medium", "large-v3"]
 
 class TranscriberWorker(threading.Thread):
     def __init__(self, filepath, model_size, language, use_gpu, out_dir,
-                 on_progress, on_done, on_error):
+                 on_status, on_segment, on_progress_pct, on_done, on_error):
         super().__init__(daemon=True)
         self.filepath = filepath
         self.model_size = model_size
         self.language = language
         self.use_gpu = use_gpu
         self.out_dir = out_dir
-        self.on_progress = on_progress
+        self.on_status = on_status
+        self.on_segment = on_segment
+        self.on_progress_pct = on_progress_pct
         self.on_done = on_done
         self.on_error = on_error
 
     def run(self):
         try:
-            self.on_progress("Cargando modelo (puede tardar la primera vez)...")
+            self.on_status("Cargando modelo (puede tardar la primera vez)...")
             from faster_whisper import WhisperModel
 
             device = "cpu"
@@ -82,28 +98,34 @@ class TranscriberWorker(threading.Thread):
                     compute_type = "int8"
 
             if device == "cpu" and self.use_gpu:
-                self.on_progress("No se detectó GPU compatible. Usando CPU...")
+                self.on_status("No se detectó GPU compatible. Usando CPU...")
 
             def run_pass(dev, ctype):
                 m = WhisperModel(self.model_size, device=dev, compute_type=ctype)
-                self.on_progress(f"Transcribiendo en {dev.upper()}... esto puede tardar unos minutos.")
+                self.on_status(f"Transcribiendo en {dev.upper()}...")
                 segs, inf = m.transcribe(
                     self.filepath,
                     language=self.language,
                     vad_filter=True,
                 )
+                total_duration = getattr(inf, "duration", None) or 0
                 out_txt, out_srt, out_plain = [], [], []
                 for i, seg in enumerate(segs, start=1):
                     start = format_timestamp_txt(seg.start)
                     end = format_timestamp_txt(seg.end)
-                    out_txt.append(f"[{start} --> {end}] {seg.text.strip()}")
-                    out_plain.append(seg.text.strip())
+                    text = seg.text.strip()
+                    out_txt.append(f"[{start} --> {end}] {text}")
+                    out_plain.append(text)
 
                     srt_start = format_timestamp_srt(seg.start)
                     srt_end = format_timestamp_srt(seg.end)
-                    out_srt.append(f"{i}\n{srt_start} --> {srt_end}\n{seg.text.strip()}\n")
+                    out_srt.append(f"{i}\n{srt_start} --> {srt_end}\n{text}\n")
 
-                    self.on_progress(f"Procesado segmento {i} ({start})...")
+                    pct = 0
+                    if total_duration > 0:
+                        pct = min(100, round((seg.end / total_duration) * 100))
+                    self.on_segment(text, start, end)
+                    self.on_progress_pct(pct)
                 return inf, out_txt, out_srt, out_plain
 
             try:
@@ -115,7 +137,7 @@ class TranscriberWorker(threading.Thread):
                     for kw in ("cublas", "cudnn", "cuda", "dll", "library")
                 )
                 if device == "cuda" and gpu_related:
-                    self.on_progress(
+                    self.on_status(
                         "La GPU falló al cargar librerías CUDA/cuDNN "
                         "(probablemente falta el CUDA Toolkit). "
                         "Reintentando automáticamente en CPU..."
@@ -146,6 +168,7 @@ class TranscriberWorker(threading.Thread):
             )
             md_path.write_text(md_content, encoding="utf-8")
 
+            self.on_progress_pct(100)
             self.on_done(str(txt_path), str(srt_path), str(md_path))
 
         except Exception as e:
@@ -153,93 +176,256 @@ class TranscriberWorker(threading.Thread):
 
 
 # --------------------------------------------------------------------------
-# Interfaz gráfica
+# Widgets auxiliares con estética "Claude"
+# --------------------------------------------------------------------------
+
+class RoundedButton(tk.Canvas):
+    """Boton con esquinas redondeadas dibujado a mano (Tkinter no las trae nativas)."""
+
+    def __init__(self, parent, text, command, bg=ACCENT, fg="white",
+                 hover_bg=ACCENT_HOVER, width=150, height=36, **kwargs):
+        super().__init__(parent, width=width, height=height, bg=PANEL,
+                          highlightthickness=0, **kwargs)
+        self.command = command
+        self.bg_color = bg
+        self.hover_color = hover_bg
+        self.fg = fg
+        self.width = width
+        self.height = height
+        self.text = text
+        self._draw(bg)
+        self.bind("<Button-1>", lambda e: self._on_click())
+        self.bind("<Enter>", lambda e: self._draw(self.hover_color))
+        self.bind("<Leave>", lambda e: self._draw(self.bg_color))
+
+    def _round_rect(self, x1, y1, x2, y2, r, **kw):
+        points = [
+            x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
+            x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
+            x1, y2, x1, y2 - r, x1, y1 + r, x1, y1,
+        ]
+        return self.create_polygon(points, smooth=True, **kw)
+
+    def _draw(self, color):
+        self.delete("all")
+        self._round_rect(2, 2, self.width - 2, self.height - 2, 10, fill=color, outline="")
+        self.create_text(self.width / 2, self.height / 2, text=self.text,
+                          fill=self.fg, font=(FONT_FAMILY, 10, "bold"))
+
+    def set_enabled(self, enabled: bool):
+        self.command_enabled = enabled
+        self._draw(self.bg_color if enabled else TEXT_MUTED)
+
+    def _on_click(self):
+        if getattr(self, "command_enabled", True) and self.command:
+            self.command()
+
+
+# --------------------------------------------------------------------------
+# Interfaz gráfica principal
 # --------------------------------------------------------------------------
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("640x480")
-        self.resizable(False, False)
+        self.geometry("1150x720")
+        self.minsize(900, 560)
+        self.configure(bg=BG)
 
         self.filepath = tk.StringVar()
         self.out_dir = tk.StringVar(value=str(Path.home() / "Transcripciones"))
         self.model_size = tk.StringVar(value="medium")
         self.language_label = tk.StringVar(value="Detectar automáticamente")
         self.use_gpu = tk.BooleanVar(value=True)
+        self.progress_pct = tk.IntVar(value=0)
 
+        self._setup_style()
         self._build_ui()
 
+    # ---------------------------------------------------------------
+    def _setup_style(self):
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        style.configure("TFrame", background=BG)
+        style.configure("Panel.TFrame", background=PANEL)
+        style.configure("TLabel", background=BG, foreground=TEXT, font=(FONT_FAMILY, 10))
+        style.configure("Panel.TLabel", background=PANEL, foreground=TEXT, font=(FONT_FAMILY, 10))
+        style.configure("Muted.TLabel", background=PANEL, foreground=TEXT_MUTED, font=(FONT_FAMILY, 9))
+        style.configure("Header.TLabel", background=BG, foreground=TEXT,
+                         font=(FONT_FAMILY, 15, "bold"))
+        style.configure("SectionTitle.TLabel", background=PANEL, foreground=TEXT,
+                         font=(FONT_FAMILY, 10, "bold"))
+        style.configure("Pct.TLabel", background=PANEL, foreground=ACCENT,
+                         font=(FONT_FAMILY, 12, "bold"))
+
+        style.configure("TEntry", fieldbackground="white", foreground=TEXT,
+                         bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER,
+                         padding=6)
+        style.configure("TCombobox", fieldbackground="white", foreground=TEXT,
+                         padding=6)
+        style.map("TCombobox", fieldbackground=[("readonly", "white")])
+
+        style.configure("TCheckbutton", background=PANEL, foreground=TEXT,
+                         font=(FONT_FAMILY, 10))
+        style.map("TCheckbutton", background=[("active", PANEL)])
+
+        style.configure("Coral.Horizontal.TProgressbar", troughcolor=TRACK,
+                         background=ACCENT, bordercolor=TRACK, lightcolor=ACCENT,
+                         darkcolor=ACCENT, thickness=10)
+
+    # ---------------------------------------------------------------
     def _build_ui(self):
-        pad = {"padx": 12, "pady": 8}
+        # ---- Encabezado ----
+        header = ttk.Frame(self, style="TFrame")
+        header.pack(fill="x", padx=20, pady=(16, 8))
 
-        # Archivo de entrada
-        frame_file = ttk.LabelFrame(self, text="Archivo de audio/video")
-        frame_file.pack(fill="x", **pad)
+        dot = tk.Canvas(header, width=14, height=14, bg=BG, highlightthickness=0)
+        dot.create_oval(1, 1, 13, 13, fill=ACCENT, outline="")
+        dot.pack(side="left", padx=(0, 8))
 
-        entry = ttk.Entry(frame_file, textvariable=self.filepath, width=60)
-        entry.pack(side="left", padx=8, pady=8, fill="x", expand=True)
+        ttk.Label(header, text=APP_TITLE, style="Header.TLabel").pack(side="left")
 
-        ttk.Button(frame_file, text="Examinar...", command=self.pick_file).pack(
-            side="left", padx=8, pady=8
+        # ---- Cuerpo: paneles divididos y ajustables ----
+        paned = ttk.PanedWindow(self, orient="horizontal")
+        paned.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+
+        left_panel = self._build_transcript_panel(paned)
+        right_panel = self._build_controls_panel(paned)
+
+        paned.add(left_panel, weight=3)
+        paned.add(right_panel, weight=2)
+
+    # ---------------------------------------------------------------
+    def _card(self, parent):
+        """Contenedor tipo tarjeta blanca con borde suave."""
+        outer = tk.Frame(parent, bg=BORDER)
+        inner = tk.Frame(outer, bg=PANEL)
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+        return outer, inner
+
+    # ---------------------------------------------------------------
+    def _build_transcript_panel(self, parent):
+        outer, card = self._card(parent)
+
+        top = tk.Frame(card, bg=PANEL)
+        top.pack(fill="x", padx=16, pady=(14, 6))
+
+        ttk.Label(top, text="Transcripción en vivo", style="SectionTitle.TLabel").pack(side="left")
+        self.pct_label = ttk.Label(top, text="0%", style="Pct.TLabel")
+        self.pct_label.pack(side="right")
+
+        self.progress = ttk.Progressbar(
+            card, mode="determinate", maximum=100, variable=self.progress_pct,
+            style="Coral.Horizontal.TProgressbar"
         )
+        self.progress.pack(fill="x", padx=16, pady=(0, 10))
+
+        ttk.Label(card, text="Puedes editar el texto libremente mientras se genera o al finalizar.",
+                  style="Muted.TLabel").pack(anchor="w", padx=16, pady=(0, 6))
+
+        text_frame = tk.Frame(card, bg=PANEL)
+        text_frame.pack(fill="both", expand=True, padx=16, pady=(0, 10))
+
+        scrollbar = ttk.Scrollbar(text_frame)
+        scrollbar.pack(side="right", fill="y")
+
+        self.transcript_text = tk.Text(
+            text_frame, wrap="word", bg="white", fg=TEXT,
+            font=(FONT_FAMILY, 11), relief="flat", padx=12, pady=12,
+            insertbackground=TEXT, yscrollcommand=scrollbar.set,
+        )
+        self.transcript_text.pack(fill="both", expand=True)
+        scrollbar.config(command=self.transcript_text.yview)
+        self.transcript_text.tag_configure("timestamp", foreground=ACCENT,
+                                            font=(FONT_FAMILY, 9, "bold"))
+
+        # Botones bajo el texto
+        btn_row = tk.Frame(card, bg=PANEL)
+        btn_row.pack(fill="x", padx=16, pady=(0, 14))
+
+        self.btn_save = RoundedButton(btn_row, "Guardar cambios", self.save_edited_transcript,
+                                       bg=ACCENT, width=160, height=34)
+        self.btn_save.pack(side="left")
+
+        ttk.Label(btn_row, text="  Sobrescribe los archivos .txt y .md con tus ediciones",
+                  style="Muted.TLabel").pack(side="left", padx=8)
+
+        return outer
+
+    # ---------------------------------------------------------------
+    def _build_controls_panel(self, parent):
+        outer, card = self._card(parent)
+        pad = {"padx": 16, "pady": 6}
+
+        ttk.Label(card, text="Configuración", style="SectionTitle.TLabel").pack(
+            anchor="w", padx=16, pady=(14, 10)
+        )
+
+        # Archivo
+        ttk.Label(card, text="Archivo de audio/video", style="Panel.TLabel").pack(anchor="w", **pad)
+        file_row = tk.Frame(card, bg=PANEL)
+        file_row.pack(fill="x", padx=16)
+        ttk.Entry(file_row, textvariable=self.filepath).pack(side="left", fill="x", expand=True, ipady=3)
+        RoundedButton(file_row, "Examinar", self.pick_file, width=100, height=30).pack(side="left", padx=(8, 0))
 
         # Carpeta de salida
-        frame_out = ttk.LabelFrame(self, text="Carpeta de salida")
-        frame_out.pack(fill="x", **pad)
+        ttk.Label(card, text="Carpeta de salida", style="Panel.TLabel").pack(anchor="w", **pad)
+        out_row = tk.Frame(card, bg=PANEL)
+        out_row.pack(fill="x", padx=16)
+        ttk.Entry(out_row, textvariable=self.out_dir).pack(side="left", fill="x", expand=True, ipady=3)
+        RoundedButton(out_row, "Elegir", self.pick_out_dir, width=100, height=30).pack(side="left", padx=(8, 0))
 
-        ttk.Entry(frame_out, textvariable=self.out_dir, width=60).pack(
-            side="left", padx=8, pady=8, fill="x", expand=True
-        )
-        ttk.Button(frame_out, text="Elegir...", command=self.pick_out_dir).pack(
-            side="left", padx=8, pady=8
-        )
+        # Modelo
+        ttk.Label(card, text="Modelo", style="Panel.TLabel").pack(anchor="w", **pad)
+        ttk.Combobox(card, textvariable=self.model_size, values=MODEL_OPTIONS,
+                     state="readonly").pack(fill="x", padx=16)
 
-        # Opciones
-        frame_opts = ttk.LabelFrame(self, text="Opciones")
-        frame_opts.pack(fill="x", **pad)
+        # Idioma
+        ttk.Label(card, text="Idioma", style="Panel.TLabel").pack(anchor="w", **pad)
+        ttk.Combobox(card, textvariable=self.language_label,
+                     values=list(LANGUAGE_MAP.keys()), state="readonly").pack(fill="x", padx=16)
 
-        ttk.Label(frame_opts, text="Modelo:").grid(row=0, column=0, sticky="w", padx=8, pady=6)
-        model_combo = ttk.Combobox(
-            frame_opts, textvariable=self.model_size, values=MODEL_OPTIONS,
-            state="readonly", width=15
-        )
-        model_combo.grid(row=0, column=1, sticky="w", padx=8, pady=6)
-
-        ttk.Label(frame_opts, text="Idioma:").grid(row=0, column=2, sticky="w", padx=8, pady=6)
-        lang_combo = ttk.Combobox(
-            frame_opts, textvariable=self.language_label,
-            values=list(LANGUAGE_MAP.keys()), state="readonly", width=22
-        )
-        lang_combo.grid(row=0, column=3, sticky="w", padx=8, pady=6)
-
-        gpu_check = ttk.Checkbutton(
-            frame_opts, text="Usar GPU (NVIDIA/CUDA) si está disponible",
-            variable=self.use_gpu
-        )
-        gpu_check.grid(row=1, column=0, columnspan=4, sticky="w", padx=8, pady=6)
+        # GPU
+        gpu_row = tk.Frame(card, bg=PANEL)
+        gpu_row.pack(fill="x", padx=16, pady=(14, 4))
+        ttk.Checkbutton(gpu_row, text="Usar GPU (NVIDIA/CUDA) si está disponible",
+                         variable=self.use_gpu).pack(anchor="w")
 
         # Botón transcribir
-        self.btn_run = ttk.Button(self, text="Transcribir", command=self.start_transcription)
-        self.btn_run.pack(pady=10)
+        run_row = tk.Frame(card, bg=PANEL)
+        run_row.pack(fill="x", padx=16, pady=(18, 10))
+        self.btn_run = RoundedButton(run_row, "Transcribir", self.start_transcription,
+                                      width=200, height=40)
+        self.btn_run.pack(anchor="w")
 
-        # Barra de progreso + estado
-        self.progress = ttk.Progressbar(self, mode="indeterminate")
-        self.progress.pack(fill="x", padx=12, pady=4)
-
+        # Estado
         self.status_var = tk.StringVar(value="Listo.")
-        ttk.Label(self, textvariable=self.status_var, wraplength=600, justify="left").pack(
-            padx=12, pady=4, anchor="w"
-        )
+        ttk.Label(card, textvariable=self.status_var, style="Muted.TLabel",
+                  wraplength=320, justify="left").pack(anchor="w", padx=16, pady=(4, 10))
 
         # Log
-        frame_log = ttk.LabelFrame(self, text="Registro")
-        frame_log.pack(fill="both", expand=True, padx=12, pady=8)
+        ttk.Label(card, text="Registro", style="SectionTitle.TLabel").pack(anchor="w", padx=16, pady=(6, 4))
+        log_frame = tk.Frame(card, bg=PANEL)
+        log_frame.pack(fill="both", expand=True, padx=16, pady=(0, 16))
 
-        self.log_text = tk.Text(frame_log, height=8, state="disabled")
-        self.log_text.pack(fill="both", expand=True, padx=6, pady=6)
+        log_scroll = ttk.Scrollbar(log_frame)
+        log_scroll.pack(side="right", fill="y")
+        self.log_text = tk.Text(log_frame, height=8, bg="#F5F4EF", fg=TEXT_MUTED,
+                                 font=(FONT_FAMILY, 9), relief="flat", padx=8, pady=8,
+                                 yscrollcommand=log_scroll.set, state="disabled")
+        self.log_text.pack(fill="both", expand=True)
+        log_scroll.config(command=self.log_text.yview)
 
+        return outer
+
+    # ---------------------------------------------------------------
+    # Acciones
+    # ---------------------------------------------------------------
     def pick_file(self):
         path = filedialog.askopenfilename(
             title="Selecciona un archivo de audio o video",
@@ -266,15 +452,26 @@ class App(tk.Tk):
         self.status_var.set(message)
         self.log(message)
 
+    def append_segment(self, text, start, end):
+        self.transcript_text.insert("end", f"[{start} → {end}] ", "timestamp")
+        self.transcript_text.insert("end", text + "\n\n")
+        self.transcript_text.see("end")
+
+    def update_progress(self, pct):
+        self.progress_pct.set(pct)
+        self.pct_label.configure(text=f"{pct}%")
+
     def start_transcription(self):
         filepath = self.filepath.get().strip()
         if not filepath or not os.path.isfile(filepath):
             messagebox.showerror(APP_TITLE, "Selecciona un archivo válido primero.")
             return
 
-        self.btn_run.configure(state="disabled")
-        self.progress.start(10)
+        self.btn_run.set_enabled(False)
+        self.transcript_text.delete("1.0", "end")
+        self.update_progress(0)
         self.set_status("Iniciando...")
+        self._last_paths = None
 
         language = LANGUAGE_MAP.get(self.language_label.get())
 
@@ -284,16 +481,18 @@ class App(tk.Tk):
             language=language,
             use_gpu=self.use_gpu.get(),
             out_dir=self.out_dir.get(),
-            on_progress=lambda msg: self.after(0, self.set_status, msg),
+            on_status=lambda msg: self.after(0, self.set_status, msg),
+            on_segment=lambda text, start, end: self.after(0, self.append_segment, text, start, end),
+            on_progress_pct=lambda pct: self.after(0, self.update_progress, pct),
             on_done=lambda txt, srt, md: self.after(0, self.on_done, txt, srt, md),
             on_error=lambda err: self.after(0, self.on_error, err),
         )
         worker.start()
 
     def on_done(self, txt_path, srt_path, md_path):
-        self.progress.stop()
-        self.btn_run.configure(state="normal")
+        self.btn_run.set_enabled(True)
         self.set_status("¡Transcripción completada!")
+        self._last_paths = (txt_path, srt_path, md_path)
         self.log(f"TXT: {txt_path}")
         self.log(f"SRT: {srt_path}")
         self.log(f"MD:  {md_path}")
@@ -303,11 +502,29 @@ class App(tk.Tk):
         )
 
     def on_error(self, error_message):
-        self.progress.stop()
-        self.btn_run.configure(state="normal")
+        self.btn_run.set_enabled(True)
         self.set_status("Ocurrió un error.")
         self.log(error_message)
         messagebox.showerror(APP_TITLE, f"Error durante la transcripción:\n\n{error_message[:500]}")
+
+    def save_edited_transcript(self):
+        if not getattr(self, "_last_paths", None):
+            messagebox.showwarning(APP_TITLE, "Todavía no hay una transcripción generada para guardar.")
+            return
+        txt_path, srt_path, md_path = self._last_paths
+        content = self.transcript_text.get("1.0", "end").strip()
+
+        Path(txt_path).write_text(content, encoding="utf-8")
+
+        plain = " ".join(
+            line.split("] ", 1)[-1] for line in content.splitlines() if line.strip()
+        )
+        md_text = Path(md_path).read_text(encoding="utf-8") if Path(md_path).exists() else ""
+        header = md_text.split("## Texto completo")[0] if "## Texto completo" in md_text else ""
+        Path(md_path).write_text(header + "## Texto completo\n\n" + plain + "\n", encoding="utf-8")
+
+        self.set_status("Cambios guardados en los archivos .txt y .md")
+        messagebox.showinfo(APP_TITLE, "Cambios guardados correctamente.")
 
 
 if __name__ == "__main__":
