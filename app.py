@@ -4,6 +4,7 @@ Usa faster-whisper para transcribir audio/video localmente, con GPU (CUDA) o CPU
 """
 
 import os
+import sys
 import threading
 import traceback
 from datetime import timedelta
@@ -98,8 +99,16 @@ class TranscriberWorker(threading.Thread):
             if device == "cpu" and self.use_gpu:
                 self.on_status("No se detectó GPU compatible. Usando CPU...")
 
+            if getattr(sys, "frozen", False):
+                base_dir = Path(sys.executable).parent
+            else:
+                base_dir = Path(__file__).resolve().parent
+            models_dir = str(base_dir / "models")
+            os.makedirs(models_dir, exist_ok=True)
+
             def run_pass(dev, ctype):
-                m = WhisperModel(self.model_size, device=dev, compute_type=ctype)
+                m = WhisperModel(self.model_size, device=dev, compute_type=ctype,
+                                  download_root=models_dir)
                 self.on_status(f"Transcribiendo en {dev.upper()}...")
                 segs, inf = m.transcribe(self.filepath, language=self.language, vad_filter=True)
                 total_duration = getattr(inf, "duration", None) or 0
@@ -235,7 +244,7 @@ class App(tk.Tk):
 
         self.filepath = tk.StringVar()
         self.out_dir = tk.StringVar(value=str(Path.home() / "Transcripciones"))
-        self.model_size = tk.StringVar(value="medium")
+        self.model_size = tk.StringVar(value="large-v3")
         self.language_label = tk.StringVar(value="Detectar automáticamente")
         self.use_gpu = tk.BooleanVar(value=True)
         self.progress_pct = tk.IntVar(value=0)
