@@ -26,8 +26,14 @@ jobs:
       - name: Compilar con PyInstaller
         run: pyinstaller --noconfirm --onefile --windowed --name "TranscriptorLocal" --collect-data faster_whisper --collect-all ctranslate2 --collect-all tokenizers app.py
 
-      - name: Subir ejecutable como artefacto
+      - name: Precargar modelos (large-v3 y medium)
+        run: |
+          mkdir dist\models
+          python -c "from faster_whisper import WhisperModel; WhisperModel('large-v3', device='cpu', compute_type='int8', download_root='dist/models')"
+          python -c "from faster_whisper import WhisperModel; WhisperModel('medium', device='cpu', compute_type='int8', download_root='dist/models')"
+
+      - name: Subir ejecutable + modelo como artefacto
         uses: actions/upload-artifact@v4
         with:
           name: TranscriptorLocal-Windows
-          path: dist/TranscriptorLocal.exe
+          path: dist
