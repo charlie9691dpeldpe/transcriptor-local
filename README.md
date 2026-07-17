@@ -1,66 +1,68 @@
-# Transcriptor Local (Whisper) — App de escritorio para Windows
+# Transcriptor Local — App de escritorio para Windows
 
 Aplicación de escritorio con interfaz gráfica para transcribir audio y video
-de forma 100% local, usando `faster-whisper`. Soporta español e inglés, y usa
-GPU NVIDIA (CUDA) automáticamente si está disponible, con fallback a CPU.
+de forma 100% local, usando Whisper (OpenAI) + PyTorch. Soporta español e
+inglés, transcripción en vivo, modo claro/oscuro, y usa GPU NVIDIA
+automáticamente si está disponible, con fallback a CPU.
 
 ## Contenido
 
-- `app.py` — código de la aplicación (Tkinter + faster-whisper)
+- `app.py` — código de la aplicación (Tkinter + Whisper/PyTorch)
 - `requirements.txt` — dependencias de Python
-- `build_exe.bat` — script para generar el `.exe` con PyInstaller
+- `build_exe.bat` — script para compilar el `.exe` localmente (opcional, no es el flujo principal)
+- `.github/workflows/build.yml` — compila el `.exe` automáticamente en GitHub Actions (flujo recomendado)
 
-## Requisitos previos (en tu PC Windows)
+## Cómo obtener la app (sin instalar Python)
 
-1. **Python 3.10 o superior** instalado (marca la opción "Add to PATH" al instalar).
-   Descárgalo desde https://www.python.org/downloads/
-2. **Para usar GPU (opcional pero recomendado):**
-   - Tarjeta NVIDIA con drivers actualizados.
-   - CUDA Toolkit y cuDNN instalados (o usa la versión que trae CUDA embebido,
-     ver nota abajo). Si no los tienes, la app detecta que no hay GPU y usa CPU
-     automáticamente — no falla.
-3. **ffmpeg** instalado y en el PATH (necesario para leer los archivos de audio/video).
-   - Más fácil: `winget install ffmpeg` en PowerShell, o descargar de
-     https://www.gyan.dev/ffmpeg/builds/ y agregarlo al PATH.
+El código vive en este repositorio, y se compila automáticamente a `.exe`
+usando GitHub Actions — no necesitas Python, PyInstaller ni nada instalado
+en tu PC para obtener el ejecutable.
 
-## Pasos para probar la app (sin empaquetar, modo rápido)
+1. Ve a la pestaña **Actions** de este repositorio.
+2. Entra a la ejecución más reciente con ✅ verde de **"Build Windows EXE"**
+   (o dispara una nueva con **Run workflow** si hiciste cambios).
+3. Baja a la sección **Artifacts** → descarga **TranscriptorLocal-Windows**.
+4. Descomprime el `.zip`. Vas a tener:
+   ```
+   TranscriptorLocal.exe
+   models/
+   ```
+5. Mantén `TranscriptorLocal.exe` y la carpeta `models` **siempre juntos**,
+   en la misma carpeta. Los modelos `large-v3` y `medium` ya vienen
+   precargados ahí — no hace falta descargar nada la primera vez.
 
-Abre una terminal (PowerShell o CMD) en la carpeta del proyecto y ejecuta:
+## Requisitos en la PC donde se USA la app
 
-```bat
-python -m venv venv
-venv\Scripts\activate
-pip install -r requirements.txt
-python app.py
-```
+1. **ffmpeg** instalado y en el PATH:
+   ```powershell
+   winget install ffmpeg
+   ```
+   Reinicia PowerShell (o la PC) después de instalar.
 
-Esto abrirá la ventana de la aplicación directamente.
-
-## Empaquetar como .exe (para usar sin terminal, doble clic)
-
-Ejecuta:
-
-```bat
-build_exe.bat
-```
-
-Al terminar, el ejecutable estará en `dist\TranscriptorLocal.exe`. Puedes
-copiar ese único archivo a cualquier carpeta o al escritorio.
-
-> Nota: la primera vez que ejecutes una transcripción, el modelo de Whisper
-> se descargará automáticamente (unos cientos de MB a ~3GB según el modelo
-> elegido) y quedará en caché para las siguientes veces.
+2. **Driver de NVIDIA actualizado** (opcional, solo para usar GPU). Con
+   PyTorch **no hace falta instalar CUDA Toolkit ni cuDNN por separado** —
+   el runtime de CUDA viene embebido dentro del propio `.exe`. Si no tienes
+   GPU o el driver falla, la app cae a CPU automáticamente sin trabarse.
 
 ## Uso de la aplicación
 
-1. **Examinar...** → selecciona tu archivo de audio o video (mp3, wav, mp4, etc.)
-2. **Elegir carpeta de salida** → dónde se guardarán los archivos generados.
+1. **Examinar** → selecciona tu archivo de audio o video (mp3, wav, mp4, etc.)
+2. **Elegir** carpeta de salida.
 3. **Modelo**: `tiny`/`base` (rápidos, menos precisos) hasta `large-v3`
-   (más lento, más preciso). Para tu uso recomiendo `medium` o `large-v3`
-   si tienes GPU.
+   (más lento, más preciso). `large-v3` y `medium` ya vienen precargados.
 4. **Idioma**: Español, Inglés, o Detectar automáticamente.
-5. Marca **Usar GPU** si tienes NVIDIA (si no la detecta, usa CPU sin fallar).
-6. Click en **Transcribir**. Verás el progreso en el registro inferior.
+5. Marca **Usar GPU** si tienes NVIDIA (si falla, usa CPU sin trabarse).
+6. Click en **Transcribir**.
+
+**Panel izquierdo** — transcripción en vivo, con barra de progreso real
+(% basado en duración del audio). El texto es editable: corrige lo que
+haga falta y usa **Guardar cambios** para sobrescribir los archivos
+generados.
+
+**Panel derecho** — todos los controles y el registro de actividad.
+
+**Modo oscuro** — botón arriba a la derecha para alternar entre tema claro
+y oscuro.
 
 Al terminar se generan 3 archivos en la carpeta de salida:
 - `nombre_transcripcion.txt` — con marcas de tiempo por segmento
@@ -69,18 +71,26 @@ Al terminar se generan 3 archivos en la carpeta de salida:
 
 ## Notas sobre GPU
 
-`faster-whisper` usa `ctranslate2`, que necesita las librerías CUDA de NVIDIA
-en el sistema para acelerar por GPU. Si al ejecutar ves en el registro
-"No se detectó GPU compatible. Usando CPU...", significa que CUDA/cuDNN no
-están instalados o no son compatibles — la app seguirá funcionando en CPU
-sin problema, solo más lento.
+La app usa PyTorch, que trae su propio runtime de CUDA embebido — no
+depende de que tengas CUDA Toolkit o cuDNN instalados en el sistema, solo
+el driver de NVIDIA normal. Esto la hace compatible con versiones de CUDA
+más nuevas sin depender de que otras librerías externas ya las soporten.
+
+Si la GPU falla al procesar (driver desactualizado, tarjeta no compatible,
+etc.), la app lo detecta automáticamente y reintenta en CPU sin
+interrumpir la transcripción.
 
 ## Modelos recomendados según tu equipo
 
-| Modelo    | VRAM/RAM aprox. | Velocidad | Precisión |
-|-----------|------------------|-----------|-----------|
-| tiny      | ~1 GB            | Muy rápido| Baja      |
-| base      | ~1 GB            | Rápido    | Media-baja|
-| small     | ~2 GB            | Media     | Media     |
-| medium    | ~5 GB            | Media-lenta| Buena    |
-| large-v3  | ~10 GB           | Lenta     | Muy buena |
+| Modelo    | VRAM/RAM aprox. | Velocidad | Precisión | Precargado |
+|-----------|------------------|-----------|-----------|------------|
+| tiny      | ~1 GB            | Muy rápido| Baja      | No |
+| base      | ~1 GB            | Rápido    | Media-baja| No |
+| small     | ~2 GB            | Media     | Media     | No |
+| medium    | ~5 GB            | Media-lenta| Buena    | **Sí** |
+| large-v3  | ~10 GB           | Lenta     | Muy buena | **Sí** |
+
+## Guía completa de referencia
+
+Para el checklist completo de instalación, reinstalación de Windows, y
+problemas ya resueltos, consulta `GUIA_MAESTRA.md`.
