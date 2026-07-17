@@ -1,7 +1,6 @@
 """
-Transcriptor de Audio Local - GUI estilo Claude
+Transcriptor de Audio Local - GUI estilo Claude (con modo claro/oscuro)
 Usa faster-whisper para transcribir audio/video localmente, con GPU (CUDA) o CPU.
-Panel dividido: transcripcion en vivo (editable) + controles.
 """
 
 import os
@@ -14,24 +13,24 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 APP_TITLE = "Transcriptor Local"
-
-# --------------------------------------------------------------------------
-# Paleta estilo Claude
-# --------------------------------------------------------------------------
-BG = "#FAF9F5"          # crema de fondo
-PANEL = "#FFFFFF"       # panel blanco
-BORDER = "#E5E4DF"      # bordes suaves
-TEXT = "#3D3929"        # texto principal
-TEXT_MUTED = "#87867F"  # texto secundario
-ACCENT = "#D97757"      # coral / naranja Claude
-ACCENT_HOVER = "#C4633F"
-TRACK = "#EDEBE3"       # fondo de barra de progreso
-
 FONT_FAMILY = "Segoe UI"
 
 # --------------------------------------------------------------------------
-# Utilidades de formato
+# Paletas estilo Claude - claro y oscuro
 # --------------------------------------------------------------------------
+LIGHT = {
+    "bg": "#FAF9F5", "panel": "#FFFFFF", "border": "#E5E4DF",
+    "text": "#3D3929", "text_muted": "#87867F", "accent": "#D97757",
+    "accent_hover": "#C4633F", "track": "#EDEBE3", "surface": "#FFFFFF",
+    "log_bg": "#F5F4EF", "btn_disabled": "#C9C7BE",
+}
+DARK = {
+    "bg": "#262624", "panel": "#30302E", "border": "#44433F",
+    "text": "#F1F0EC", "text_muted": "#A9A8A0", "accent": "#D97757",
+    "accent_hover": "#E08863", "track": "#3D3B36", "surface": "#3A3935",
+    "log_bg": "#211F1C", "btn_disabled": "#5A5852",
+}
+
 
 def format_timestamp_srt(seconds: float) -> str:
     td = timedelta(seconds=max(0, seconds))
@@ -55,12 +54,11 @@ LANGUAGE_MAP = {
     "Español": "es",
     "Inglés": "en",
 }
-
 MODEL_OPTIONS = ["tiny", "base", "small", "medium", "large-v3"]
 
 
 # --------------------------------------------------------------------------
-# Lógica de transcripción (corre en un hilo aparte para no congelar la GUI)
+# Lógica de transcripción (hilo aparte)
 # --------------------------------------------------------------------------
 
 class TranscriberWorker(threading.Thread):
@@ -103,11 +101,7 @@ class TranscriberWorker(threading.Thread):
             def run_pass(dev, ctype):
                 m = WhisperModel(self.model_size, device=dev, compute_type=ctype)
                 self.on_status(f"Transcribiendo en {dev.upper()}...")
-                segs, inf = m.transcribe(
-                    self.filepath,
-                    language=self.language,
-                    vad_filter=True,
-                )
+                segs, inf = m.transcribe(self.filepath, language=self.language, vad_filter=True)
                 total_duration = getattr(inf, "duration", None) or 0
                 out_txt, out_srt, out_plain = [], [], []
                 for i, seg in enumerate(segs, start=1):
@@ -132,15 +126,11 @@ class TranscriberWorker(threading.Thread):
                 info, lines_txt, lines_srt, plain_text = run_pass(device, compute_type)
             except Exception as gpu_err:
                 error_text = str(gpu_err).lower()
-                gpu_related = any(
-                    kw in error_text
-                    for kw in ("cublas", "cudnn", "cuda", "dll", "library")
-                )
+                gpu_related = any(kw in error_text for kw in ("cublas", "cudnn", "cuda", "dll", "library"))
                 if device == "cuda" and gpu_related:
                     self.on_status(
                         "La GPU falló al cargar librerías CUDA/cuDNN "
-                        "(probablemente falta el CUDA Toolkit). "
-                        "Reintentando automáticamente en CPU..."
+                        "(probablemente falta el CUDA Toolkit). Reintentando en CPU..."
                     )
                     device, compute_type = "cpu", "int8"
                     info, lines_txt, lines_srt, plain_text = run_pass(device, compute_type)
@@ -163,61 +153,69 @@ class TranscriberWorker(threading.Thread):
                 f"# Transcripción: {base_name}\n\n"
                 f"- Idioma detectado/usado: {detected_lang}\n"
                 f"- Modelo: {self.model_size}\n\n"
-                f"## Texto completo\n\n"
-                f"{' '.join(plain_text)}\n"
+                f"## Texto completo\n\n{' '.join(plain_text)}\n"
             )
             md_path.write_text(md_content, encoding="utf-8")
 
             self.on_progress_pct(100)
             self.on_done(str(txt_path), str(srt_path), str(md_path))
-
         except Exception as e:
             self.on_error(f"{e}\n\n{traceback.format_exc()}")
 
 
 # --------------------------------------------------------------------------
-# Widgets auxiliares con estética "Claude"
+# Boton con esquinas redondeadas, re-tematizable
 # --------------------------------------------------------------------------
 
 class RoundedButton(tk.Canvas):
-    """Boton con esquinas redondeadas dibujado a mano (Tkinter no las trae nativas)."""
-
-    def __init__(self, parent, text, command, bg=ACCENT, fg="white",
-                 hover_bg=ACCENT_HOVER, width=150, height=36, **kwargs):
-        super().__init__(parent, width=width, height=height, bg=PANEL,
+    def __init__(self, parent, text, command, colors, panel_bg,
+                 width=150, height=36, use_accent=True, **kwargs):
+        super().__init__(parent, width=width, height=height, bg=panel_bg,
                           highlightthickness=0, **kwargs)
         self.command = command
-        self.bg_color = bg
-        self.hover_color = hover_bg
-        self.fg = fg
+        self.colors = colors
         self.width = width
         self.height = height
         self.text = text
-        self._draw(bg)
+        self.use_accent = use_accent
+        self.command_enabled = True
+        self._draw(self._fill_color())
         self.bind("<Button-1>", lambda e: self._on_click())
-        self.bind("<Enter>", lambda e: self._draw(self.hover_color))
-        self.bind("<Leave>", lambda e: self._draw(self.bg_color))
+        self.bind("<Enter>", lambda e: self._draw(self._hover_color()))
+        self.bind("<Leave>", lambda e: self._draw(self._fill_color()))
+
+    def _fill_color(self):
+        if not self.command_enabled:
+            return self.colors["btn_disabled"]
+        return self.colors["accent"] if self.use_accent else self.colors["surface"]
+
+    def _hover_color(self):
+        if not self.command_enabled:
+            return self.colors["btn_disabled"]
+        return self.colors["accent_hover"] if self.use_accent else self.colors["track"]
 
     def _round_rect(self, x1, y1, x2, y2, r, **kw):
-        points = [
-            x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
-            x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
-            x1, y2, x1, y2 - r, x1, y1 + r, x1, y1,
-        ]
+        points = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+                  x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
         return self.create_polygon(points, smooth=True, **kw)
 
     def _draw(self, color):
         self.delete("all")
         self._round_rect(2, 2, self.width - 2, self.height - 2, 10, fill=color, outline="")
+        text_color = "white" if self.use_accent else self.colors["text"]
         self.create_text(self.width / 2, self.height / 2, text=self.text,
-                          fill=self.fg, font=(FONT_FAMILY, 10, "bold"))
+                          fill=text_color, font=(FONT_FAMILY, 10, "bold"))
 
     def set_enabled(self, enabled: bool):
         self.command_enabled = enabled
-        self._draw(self.bg_color if enabled else TEXT_MUTED)
+        self._draw(self._fill_color())
+
+    def set_panel_bg(self, panel_bg):
+        self.configure(bg=panel_bg)
+        self._draw(self._fill_color())
 
     def _on_click(self):
-        if getattr(self, "command_enabled", True) and self.command:
+        if self.command_enabled and self.command:
             self.command()
 
 
@@ -231,7 +229,9 @@ class App(tk.Tk):
         self.title(APP_TITLE)
         self.geometry("1150x720")
         self.minsize(900, 560)
-        self.configure(bg=BG)
+
+        self.theme_name = "light"
+        self.colors = LIGHT
 
         self.filepath = tk.StringVar()
         self.out_dir = tk.StringVar(value=str(Path.home() / "Transcripciones"))
@@ -239,121 +239,130 @@ class App(tk.Tk):
         self.language_label = tk.StringVar(value="Detectar automáticamente")
         self.use_gpu = tk.BooleanVar(value=True)
         self.progress_pct = tk.IntVar(value=0)
+        self._last_paths = None
 
-        self._setup_style()
-        self._build_ui()
+        # Registro de widgets "planos" (no-ttk) que hay que retematizar
+        self._bg_frames = []       # frames con color de fondo tipo 'bg'
+        self._panel_frames = []    # frames con color de fondo tipo 'panel'
+        self._border_frames = []   # frames usados como borde de tarjeta
+        self._surface_widgets = []  # Text widgets tipo 'surface' (blanco/gris oscuro)
+        self._log_widgets = []
+        self._round_buttons_accent = []
+        self._round_buttons_plain = []
+        self._canvases_bg = []      # canvases cuyo fondo es 'bg' (ej. el punto decorativo)
 
-    # ---------------------------------------------------------------
-    def _setup_style(self):
-        style = ttk.Style(self)
+        self.configure(bg=self.colors["bg"])
+        self.style = ttk.Style(self)
         try:
-            style.theme_use("clam")
+            self.style.theme_use("clam")
         except tk.TclError:
             pass
 
-        style.configure("TFrame", background=BG)
-        style.configure("Panel.TFrame", background=PANEL)
-        style.configure("TLabel", background=BG, foreground=TEXT, font=(FONT_FAMILY, 10))
-        style.configure("Panel.TLabel", background=PANEL, foreground=TEXT, font=(FONT_FAMILY, 10))
-        style.configure("Muted.TLabel", background=PANEL, foreground=TEXT_MUTED, font=(FONT_FAMILY, 9))
-        style.configure("Header.TLabel", background=BG, foreground=TEXT,
-                         font=(FONT_FAMILY, 15, "bold"))
-        style.configure("SectionTitle.TLabel", background=PANEL, foreground=TEXT,
-                         font=(FONT_FAMILY, 10, "bold"))
-        style.configure("Pct.TLabel", background=PANEL, foreground=ACCENT,
-                         font=(FONT_FAMILY, 12, "bold"))
+        self._build_ui()
+        self._apply_theme()
 
-        style.configure("TEntry", fieldbackground="white", foreground=TEXT,
-                         bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER,
-                         padding=6)
-        style.configure("TCombobox", fieldbackground="white", foreground=TEXT,
-                         padding=6)
-        style.map("TCombobox", fieldbackground=[("readonly", "white")])
+    # ---------------------------------------------------------------
+    def _card(self, parent):
+        outer = tk.Frame(parent, bg=self.colors["border"])
+        inner = tk.Frame(outer, bg=self.colors["panel"])
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+        self._border_frames.append(outer)
+        self._panel_frames.append(inner)
+        return outer, inner
 
-        style.configure("TCheckbutton", background=PANEL, foreground=TEXT,
-                         font=(FONT_FAMILY, 10))
-        style.map("TCheckbutton", background=[("active", PANEL)])
-
-        style.configure("Coral.Horizontal.TProgressbar", troughcolor=TRACK,
-                         background=ACCENT, bordercolor=TRACK, lightcolor=ACCENT,
-                         darkcolor=ACCENT, thickness=10)
+    def _panel_frame(self, parent):
+        f = tk.Frame(parent, bg=self.colors["panel"])
+        self._panel_frames.append(f)
+        return f
 
     # ---------------------------------------------------------------
     def _build_ui(self):
-        # ---- Encabezado ----
-        header = ttk.Frame(self, style="TFrame")
+        header = tk.Frame(self, bg=self.colors["bg"])
         header.pack(fill="x", padx=20, pady=(16, 8))
+        self._bg_frames.append(header)
 
-        dot = tk.Canvas(header, width=14, height=14, bg=BG, highlightthickness=0)
-        dot.create_oval(1, 1, 13, 13, fill=ACCENT, outline="")
+        dot = tk.Canvas(header, width=14, height=14, bg=self.colors["bg"], highlightthickness=0)
+        dot.create_oval(1, 1, 13, 13, fill=self.colors["accent"], outline="")
         dot.pack(side="left", padx=(0, 8))
+        self._canvases_bg.append(dot)
 
-        ttk.Label(header, text=APP_TITLE, style="Header.TLabel").pack(side="left")
+        self.title_label = tk.Label(header, text=APP_TITLE, bg=self.colors["bg"],
+                                     fg=self.colors["text"], font=(FONT_FAMILY, 15, "bold"))
+        self.title_label.pack(side="left")
 
-        # ---- Cuerpo: paneles divididos y ajustables ----
+        self.theme_btn = RoundedButton(header, "🌙 Modo oscuro", self.toggle_theme,
+                                        self.colors, self.colors["bg"], width=150, height=32,
+                                        use_accent=False)
+        self.theme_btn.pack(side="right")
+        self._round_buttons_plain.append(self.theme_btn)
+
         paned = ttk.PanedWindow(self, orient="horizontal")
         paned.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
         left_panel = self._build_transcript_panel(paned)
         right_panel = self._build_controls_panel(paned)
-
         paned.add(left_panel, weight=3)
         paned.add(right_panel, weight=2)
-
-    # ---------------------------------------------------------------
-    def _card(self, parent):
-        """Contenedor tipo tarjeta blanca con borde suave."""
-        outer = tk.Frame(parent, bg=BORDER)
-        inner = tk.Frame(outer, bg=PANEL)
-        inner.pack(fill="both", expand=True, padx=1, pady=1)
-        return outer, inner
 
     # ---------------------------------------------------------------
     def _build_transcript_panel(self, parent):
         outer, card = self._card(parent)
 
-        top = tk.Frame(card, bg=PANEL)
+        top = self._panel_frame(card)
         top.pack(fill="x", padx=16, pady=(14, 6))
 
-        ttk.Label(top, text="Transcripción en vivo", style="SectionTitle.TLabel").pack(side="left")
-        self.pct_label = ttk.Label(top, text="0%", style="Pct.TLabel")
+        self.transcript_title = tk.Label(top, text="Transcripción en vivo", bg=self.colors["panel"],
+                                          fg=self.colors["text"], font=(FONT_FAMILY, 10, "bold"))
+        self.transcript_title.pack(side="left")
+
+        self.pct_label = tk.Label(top, text="0%", bg=self.colors["panel"],
+                                   fg=self.colors["accent"], font=(FONT_FAMILY, 12, "bold"))
         self.pct_label.pack(side="right")
 
-        self.progress = ttk.Progressbar(
-            card, mode="determinate", maximum=100, variable=self.progress_pct,
-            style="Coral.Horizontal.TProgressbar"
-        )
+        self.style.configure("Coral.Horizontal.TProgressbar", troughcolor=self.colors["track"],
+                              background=self.colors["accent"], bordercolor=self.colors["track"],
+                              lightcolor=self.colors["accent"], darkcolor=self.colors["accent"],
+                              thickness=10)
+        self.progress = ttk.Progressbar(card, mode="determinate", maximum=100,
+                                         variable=self.progress_pct,
+                                         style="Coral.Horizontal.TProgressbar")
         self.progress.pack(fill="x", padx=16, pady=(0, 10))
 
-        ttk.Label(card, text="Puedes editar el texto libremente mientras se genera o al finalizar.",
-                  style="Muted.TLabel").pack(anchor="w", padx=16, pady=(0, 6))
+        self.hint_label = tk.Label(
+            card, text="Puedes editar el texto libremente mientras se genera o al finalizar.",
+            bg=self.colors["panel"], fg=self.colors["text_muted"], font=(FONT_FAMILY, 9)
+        )
+        self.hint_label.pack(anchor="w", padx=16, pady=(0, 6))
 
-        text_frame = tk.Frame(card, bg=PANEL)
+        text_frame = self._panel_frame(card)
         text_frame.pack(fill="both", expand=True, padx=16, pady=(0, 10))
 
         scrollbar = ttk.Scrollbar(text_frame)
         scrollbar.pack(side="right", fill="y")
 
         self.transcript_text = tk.Text(
-            text_frame, wrap="word", bg="white", fg=TEXT,
+            text_frame, wrap="word", bg=self.colors["surface"], fg=self.colors["text"],
             font=(FONT_FAMILY, 11), relief="flat", padx=12, pady=12,
-            insertbackground=TEXT, yscrollcommand=scrollbar.set,
+            insertbackground=self.colors["text"], yscrollcommand=scrollbar.set,
         )
         self.transcript_text.pack(fill="both", expand=True)
         scrollbar.config(command=self.transcript_text.yview)
-        self.transcript_text.tag_configure("timestamp", foreground=ACCENT,
+        self.transcript_text.tag_configure("timestamp", foreground=self.colors["accent"],
                                             font=(FONT_FAMILY, 9, "bold"))
+        self._surface_widgets.append(self.transcript_text)
 
-        # Botones bajo el texto
-        btn_row = tk.Frame(card, bg=PANEL)
+        btn_row = self._panel_frame(card)
         btn_row.pack(fill="x", padx=16, pady=(0, 14))
 
         self.btn_save = RoundedButton(btn_row, "Guardar cambios", self.save_edited_transcript,
-                                       bg=ACCENT, width=160, height=34)
+                                       self.colors, self.colors["panel"], width=160, height=34)
         self.btn_save.pack(side="left")
+        self._round_buttons_accent.append(self.btn_save)
 
-        ttk.Label(btn_row, text="  Sobrescribe los archivos .txt y .md con tus ediciones",
-                  style="Muted.TLabel").pack(side="left", padx=8)
+        self.save_hint = tk.Label(btn_row, text="  Sobrescribe los archivos .txt y .md con tus ediciones",
+                                   bg=self.colors["panel"], fg=self.colors["text_muted"],
+                                   font=(FONT_FAMILY, 9))
+        self.save_hint.pack(side="left", padx=8)
 
         return outer
 
@@ -362,66 +371,143 @@ class App(tk.Tk):
         outer, card = self._card(parent)
         pad = {"padx": 16, "pady": 6}
 
-        ttk.Label(card, text="Configuración", style="SectionTitle.TLabel").pack(
-            anchor="w", padx=16, pady=(14, 10)
-        )
+        self.config_title = tk.Label(card, text="Configuración", bg=self.colors["panel"],
+                                      fg=self.colors["text"], font=(FONT_FAMILY, 10, "bold"))
+        self.config_title.pack(anchor="w", padx=16, pady=(14, 10))
 
-        # Archivo
-        ttk.Label(card, text="Archivo de audio/video", style="Panel.TLabel").pack(anchor="w", **pad)
-        file_row = tk.Frame(card, bg=PANEL)
+        self._field_labels = []
+
+        def field_label(text, parent_widget):
+            lbl = tk.Label(parent_widget, text=text, bg=self.colors["panel"],
+                            fg=self.colors["text"], font=(FONT_FAMILY, 10))
+            lbl.pack(anchor="w", **pad)
+            self._field_labels.append(lbl)
+            return lbl
+
+        field_label("Archivo de audio/video", card)
+        file_row = self._panel_frame(card)
         file_row.pack(fill="x", padx=16)
         ttk.Entry(file_row, textvariable=self.filepath).pack(side="left", fill="x", expand=True, ipady=3)
-        RoundedButton(file_row, "Examinar", self.pick_file, width=100, height=30).pack(side="left", padx=(8, 0))
+        b1 = RoundedButton(file_row, "Examinar", self.pick_file, self.colors, self.colors["panel"],
+                            width=100, height=30)
+        b1.pack(side="left", padx=(8, 0))
+        self._round_buttons_accent.append(b1)
 
-        # Carpeta de salida
-        ttk.Label(card, text="Carpeta de salida", style="Panel.TLabel").pack(anchor="w", **pad)
-        out_row = tk.Frame(card, bg=PANEL)
+        field_label("Carpeta de salida", card)
+        out_row = self._panel_frame(card)
         out_row.pack(fill="x", padx=16)
         ttk.Entry(out_row, textvariable=self.out_dir).pack(side="left", fill="x", expand=True, ipady=3)
-        RoundedButton(out_row, "Elegir", self.pick_out_dir, width=100, height=30).pack(side="left", padx=(8, 0))
+        b2 = RoundedButton(out_row, "Elegir", self.pick_out_dir, self.colors, self.colors["panel"],
+                            width=100, height=30)
+        b2.pack(side="left", padx=(8, 0))
+        self._round_buttons_accent.append(b2)
 
-        # Modelo
-        ttk.Label(card, text="Modelo", style="Panel.TLabel").pack(anchor="w", **pad)
+        field_label("Modelo", card)
         ttk.Combobox(card, textvariable=self.model_size, values=MODEL_OPTIONS,
                      state="readonly").pack(fill="x", padx=16)
 
-        # Idioma
-        ttk.Label(card, text="Idioma", style="Panel.TLabel").pack(anchor="w", **pad)
+        field_label("Idioma", card)
         ttk.Combobox(card, textvariable=self.language_label,
                      values=list(LANGUAGE_MAP.keys()), state="readonly").pack(fill="x", padx=16)
 
-        # GPU
-        gpu_row = tk.Frame(card, bg=PANEL)
+        gpu_row = self._panel_frame(card)
         gpu_row.pack(fill="x", padx=16, pady=(14, 4))
         ttk.Checkbutton(gpu_row, text="Usar GPU (NVIDIA/CUDA) si está disponible",
                          variable=self.use_gpu).pack(anchor="w")
 
-        # Botón transcribir
-        run_row = tk.Frame(card, bg=PANEL)
+        run_row = self._panel_frame(card)
         run_row.pack(fill="x", padx=16, pady=(18, 10))
         self.btn_run = RoundedButton(run_row, "Transcribir", self.start_transcription,
-                                      width=200, height=40)
+                                      self.colors, self.colors["panel"], width=200, height=40)
         self.btn_run.pack(anchor="w")
+        self._round_buttons_accent.append(self.btn_run)
 
-        # Estado
         self.status_var = tk.StringVar(value="Listo.")
-        ttk.Label(card, textvariable=self.status_var, style="Muted.TLabel",
-                  wraplength=320, justify="left").pack(anchor="w", padx=16, pady=(4, 10))
+        self.status_label = tk.Label(card, textvariable=self.status_var, bg=self.colors["panel"],
+                                      fg=self.colors["text_muted"], font=(FONT_FAMILY, 9),
+                                      wraplength=320, justify="left")
+        self.status_label.pack(anchor="w", padx=16, pady=(4, 10))
 
-        # Log
-        ttk.Label(card, text="Registro", style="SectionTitle.TLabel").pack(anchor="w", padx=16, pady=(6, 4))
-        log_frame = tk.Frame(card, bg=PANEL)
+        self.log_title = tk.Label(card, text="Registro", bg=self.colors["panel"],
+                                   fg=self.colors["text"], font=(FONT_FAMILY, 10, "bold"))
+        self.log_title.pack(anchor="w", padx=16, pady=(6, 4))
+
+        log_frame = self._panel_frame(card)
         log_frame.pack(fill="both", expand=True, padx=16, pady=(0, 16))
 
         log_scroll = ttk.Scrollbar(log_frame)
         log_scroll.pack(side="right", fill="y")
-        self.log_text = tk.Text(log_frame, height=8, bg="#F5F4EF", fg=TEXT_MUTED,
-                                 font=(FONT_FAMILY, 9), relief="flat", padx=8, pady=8,
+        self.log_text = tk.Text(log_frame, height=8, bg=self.colors["log_bg"],
+                                 fg=self.colors["text_muted"], font=(FONT_FAMILY, 9),
+                                 relief="flat", padx=8, pady=8,
                                  yscrollcommand=log_scroll.set, state="disabled")
         self.log_text.pack(fill="both", expand=True)
         log_scroll.config(command=self.log_text.yview)
+        self._log_widgets.append(self.log_text)
 
         return outer
+
+    # ---------------------------------------------------------------
+    # Tema claro/oscuro
+    # ---------------------------------------------------------------
+    def toggle_theme(self):
+        self.theme_name = "dark" if self.theme_name == "light" else "light"
+        self.colors = DARK if self.theme_name == "dark" else LIGHT
+        self._apply_theme()
+
+    def _apply_theme(self):
+        c = self.colors
+        self.configure(bg=c["bg"])
+
+        for f in self._bg_frames:
+            f.configure(bg=c["bg"])
+        for f in self._panel_frames:
+            f.configure(bg=c["panel"])
+        for f in self._border_frames:
+            f.configure(bg=c["border"])
+        for cv in self._canvases_bg:
+            cv.configure(bg=c["bg"])
+            cv.itemconfig(1, fill=c["accent"])
+
+        self.title_label.configure(bg=c["bg"], fg=c["text"])
+        self.transcript_title.configure(bg=c["panel"], fg=c["text"])
+        self.pct_label.configure(bg=c["panel"], fg=c["accent"])
+        self.hint_label.configure(bg=c["panel"], fg=c["text_muted"])
+        self.save_hint.configure(bg=c["panel"], fg=c["text_muted"])
+        self.config_title.configure(bg=c["panel"], fg=c["text"])
+        self.status_label.configure(bg=c["panel"], fg=c["text_muted"])
+        self.log_title.configure(bg=c["panel"], fg=c["text"])
+
+        for lbl in self._field_labels:
+            lbl.configure(bg=c["panel"], fg=c["text"])
+
+        for tw in self._surface_widgets:
+            tw.configure(bg=c["surface"], fg=c["text"], insertbackground=c["text"])
+            tw.tag_configure("timestamp", foreground=c["accent"])
+
+        for tw in self._log_widgets:
+            tw.configure(bg=c["log_bg"], fg=c["text_muted"])
+
+        self.style.configure("Coral.Horizontal.TProgressbar", troughcolor=c["track"],
+                              background=c["accent"], bordercolor=c["track"],
+                              lightcolor=c["accent"], darkcolor=c["accent"])
+
+        self.style.configure("TEntry", fieldbackground=c["surface"], foreground=c["text"],
+                              bordercolor=c["border"], lightcolor=c["border"], darkcolor=c["border"])
+        self.style.configure("TCombobox", fieldbackground=c["surface"], foreground=c["text"])
+        self.style.map("TCombobox", fieldbackground=[("readonly", c["surface"])])
+        self.style.configure("TCheckbutton", background=c["panel"], foreground=c["text"])
+        self.style.map("TCheckbutton", background=[("active", c["panel"])])
+
+        for btn in self._round_buttons_accent:
+            btn.colors = c
+            btn.set_panel_bg(c["panel"])
+        for btn in self._round_buttons_plain:
+            btn.colors = c
+            btn.set_panel_bg(c["bg"])
+
+        self.theme_btn.text = "☀️ Modo claro" if self.theme_name == "dark" else "🌙 Modo oscuro"
+        self.theme_btn._draw(self.theme_btn._fill_color())
 
     # ---------------------------------------------------------------
     # Acciones
@@ -496,10 +582,7 @@ class App(tk.Tk):
         self.log(f"TXT: {txt_path}")
         self.log(f"SRT: {srt_path}")
         self.log(f"MD:  {md_path}")
-        messagebox.showinfo(
-            APP_TITLE,
-            f"Transcripción completada.\n\nArchivos guardados en:\n{Path(txt_path).parent}",
-        )
+        messagebox.showinfo(APP_TITLE, f"Transcripción completada.\n\nArchivos guardados en:\n{Path(txt_path).parent}")
 
     def on_error(self, error_message):
         self.btn_run.set_enabled(True)
@@ -508,7 +591,7 @@ class App(tk.Tk):
         messagebox.showerror(APP_TITLE, f"Error durante la transcripción:\n\n{error_message[:500]}")
 
     def save_edited_transcript(self):
-        if not getattr(self, "_last_paths", None):
+        if not self._last_paths:
             messagebox.showwarning(APP_TITLE, "Todavía no hay una transcripción generada para guardar.")
             return
         txt_path, srt_path, md_path = self._last_paths
@@ -516,9 +599,7 @@ class App(tk.Tk):
 
         Path(txt_path).write_text(content, encoding="utf-8")
 
-        plain = " ".join(
-            line.split("] ", 1)[-1] for line in content.splitlines() if line.strip()
-        )
+        plain = " ".join(line.split("] ", 1)[-1] for line in content.splitlines() if line.strip())
         md_text = Path(md_path).read_text(encoding="utf-8") if Path(md_path).exists() else ""
         header = md_text.split("## Texto completo")[0] if "## Texto completo" in md_text else ""
         Path(md_path).write_text(header + "## Texto completo\n\n" + plain + "\n", encoding="utf-8")
