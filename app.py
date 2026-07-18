@@ -6,6 +6,7 @@ instalados por separado en el sistema.
 """
 
 import os
+import math
 import sys
 import threading
 import traceback
@@ -137,7 +138,8 @@ class TranscriberWorker(threading.Thread):
     """
 
     def __init__(self, filepath, model_size, language, use_gpu, out_dir,
-                 on_status, on_segment, on_progress_pct, on_done, on_error, on_clear=None):
+                 on_status, on_segment, on_progress_pct, on_done, on_error,
+                 on_clear=None, on_time_update=None):
         super().__init__(daemon=True)
         self.filepath = filepath
         self.model_size = model_size
@@ -150,11 +152,26 @@ class TranscriberWorker(threading.Thread):
         self.on_done = on_done
         self.on_error = on_error
         self.on_clear = on_clear or (lambda: None)
+        self.on_time_update = on_time_update or (lambda elapsed, eta: None)
+
+    CHUNK_SECONDS = 300  # procesar en bloques de 5 minutos
+
+    @staticmethod
+    def _fmt_duration(seconds):
+        seconds = max(0, int(seconds))
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h}h {m:02d}m {s:02d}s"
+        return f"{m}m {s:02d}s"
 
     def run(self):
         try:
             self.on_status("Cargando motor de transcripción (Whisper + PyTorch)...")
+            import time
+            import numpy as np
             import whisper
+            import whisper.audio as whisper_audio
             import torch
 
             device = "cpu"
@@ -181,103 +198,82 @@ class TranscriberWorker(threading.Thread):
             models_dir = str(base_dir / "models")
             os.makedirs(models_dir, exist_ok=True)
 
-            # No usamos el parche de tqdm para la transcripción (activar
-            # verbose=True, necesario para el streaming en vivo, desactiva
-            # la barra de progreso interna). En su lugar calculamos el %
-            # nosotros mismos según el timestamp del último segmento vs.
-            # la duración total del audio.
             _set_progress_callback(None)
 
-            self.on_status("Calculando duración del audio...")
-            import whisper.audio as whisper_audio
-            try:
-                audio_array = whisper_audio.load_audio(self.filepath)
-                total_duration = len(audio_array) / whisper_audio.SAMPLE_RATE
-            except Exception:
-                total_duration = 0
+            self.on_status("Cargando audio completo en memoria...")
+            audio_array = whisper_audio.load_audio(self.filepath)
+            sr = whisper_audio.SAMPLE_RATE
+            total_duration = len(audio_array) / sr
+            self.on_status(f"Duración de audio detectada: {total_duration:.1f} segundos")
 
-            import re as _re
-            ts_line_re = _re.compile(r"^\[(.+?) --> (.+?)\] (.*)$")
-
-            def _parse_ts_to_seconds(ts):
-                parts = [float(p) for p in ts.split(":")]
-                while len(parts) < 3:
-                    parts.insert(0, 0.0)
-                h, mnt, s = parts
-                return h * 3600 + mnt * 60 + s
+            chunk_samples = int(self.CHUNK_SECONDS * sr)
+            total_samples = len(audio_array)
+            num_chunks = max(1, math.ceil(total_samples / chunk_samples))
 
             def run_pass(dev):
                 self.on_status(f"Cargando modelo '{self.model_size}' en {dev.upper()}...")
                 m = whisper.load_model(self.model_size, device=dev, download_root=models_dir)
-                self.on_status(f"Transcribiendo en {dev.upper()}... esto puede tardar unos minutos.")
-
-                collected = []
-
-                import whisper.transcribe as whisper_transcribe_module
-
-                def _live_print(*args, **kwargs):
-                    try:
-                        line = str(args[0]) if args else ""
-                        match = ts_line_re.match(line)
-                        if match:
-                            start_str, end_str, text = match.group(1), match.group(2), match.group(3)
-                            start_sec = _parse_ts_to_seconds(start_str)
-                            end_sec = _parse_ts_to_seconds(end_str)
-                            text = text.strip()
-                            collected.append((start_sec, end_sec, text))
-                            start_fmt = format_timestamp_txt(start_sec)
-                            end_fmt = format_timestamp_txt(end_sec)
-                            self.on_segment(text, start_fmt, end_fmt)
-                            if total_duration > 0:
-                                pct = min(100, int(end_sec / total_duration * 100))
-                                self.on_progress_pct(pct)
-                    except Exception:
-                        pass
-
-                whisper_transcribe_module.print = _live_print
-                try:
-                    result = m.transcribe(
-                        self.filepath,
-                        language=self.language,
-                        fp16=(dev == "cuda"),
-                        verbose=True,
-                    )
-                finally:
-                    whisper_transcribe_module.print = print
-
-                self.on_status(f"Segmentos capturados en vivo: {len(collected)}")
-
-                # Fuente autoritativa: siempre usamos result["segments"], que
-                # la librería garantiza completo, sin importar si el "modo en
-                # vivo" (interceptar el print interno) logró mostrar algo o
-                # no. Así los archivos finales nunca quedan vacíos.
-                final_segments = result.get("segments", [])
-
-                if not collected and final_segments:
-                    # El hook en vivo no capturó nada (por ejemplo, por una
-                    # diferencia interna de la librería) -> mostramos todo
-                    # de una vez como respaldo, en vez de dejar el panel vacío.
-                    self.on_status(
-                        "El modo en vivo no capturó texto; mostrando el "
-                        "resultado completo ahora."
-                    )
-                    for seg in final_segments:
-                        start_fmt = format_timestamp_txt(seg["start"])
-                        end_fmt = format_timestamp_txt(seg["end"])
-                        self.on_segment(seg["text"].strip(), start_fmt, end_fmt)
-                    self.on_progress_pct(100)
+                self.on_status(
+                    f"Transcribiendo en {dev.upper()} en {num_chunks} bloque(s) de "
+                    f"{self.CHUNK_SECONDS // 60} min..."
+                )
 
                 out_txt, out_srt, out_plain = [], [], []
-                for i, seg in enumerate(final_segments, start=1):
-                    start_sec, end_sec, text = seg["start"], seg["end"], seg["text"].strip()
-                    start_fmt = format_timestamp_txt(start_sec)
-                    end_fmt = format_timestamp_txt(end_sec)
-                    out_txt.append(f"[{start_fmt} --> {end_fmt}] {text}")
-                    out_plain.append(text)
-                    out_srt.append(
-                        f"{i}\n{format_timestamp_srt(start_sec)} --> {format_timestamp_srt(end_sec)}\n{text}\n"
+                detected_lang = self.language
+                prev_text_tail = None
+                start_time = time.time()
+
+                for idx in range(num_chunks):
+                    chunk_start_sample = idx * chunk_samples
+                    chunk_end_sample = min(total_samples, chunk_start_sample + chunk_samples)
+                    chunk = audio_array[chunk_start_sample:chunk_end_sample]
+                    chunk_offset = chunk_start_sample / sr
+
+                    self.on_status(f"Procesando bloque {idx + 1} de {num_chunks}...")
+
+                    result = m.transcribe(
+                        chunk.astype(np.float32),
+                        language=self.language,
+                        fp16=(dev == "cuda"),
+                        verbose=False,
+                        initial_prompt=prev_text_tail,
                     )
-                return result.get("language", self.language), out_txt, out_srt, out_plain
+
+                    if detected_lang is None:
+                        detected_lang = result.get("language")
+
+                    chunk_segments = result.get("segments", [])
+                    for seg in chunk_segments:
+                        start_sec = seg["start"] + chunk_offset
+                        end_sec = seg["end"] + chunk_offset
+                        text = seg["text"].strip()
+                        if not text:
+                            continue
+                        start_fmt = format_timestamp_txt(start_sec)
+                        end_fmt = format_timestamp_txt(end_sec)
+                        out_txt.append(f"[{start_fmt} --> {end_fmt}] {text}")
+                        out_plain.append(text)
+                        out_srt.append(
+                            f"{len(out_plain)}\n{format_timestamp_srt(start_sec)} --> "
+                            f"{format_timestamp_srt(end_sec)}\n{text}\n"
+                        )
+                        self.on_segment(text, start_fmt, end_fmt)
+
+                    chunk_text = result.get("text", "").strip()
+                    prev_text_tail = chunk_text[-200:] if chunk_text else prev_text_tail
+
+                    # Progreso, tiempo transcurrido y tiempo restante estimado
+                    chunks_done = idx + 1
+                    elapsed = time.time() - start_time
+                    avg_per_chunk = elapsed / chunks_done
+                    remaining_chunks = num_chunks - chunks_done
+                    eta = avg_per_chunk * remaining_chunks
+
+                    pct = min(100, int(chunk_end_sample / total_samples * 100))
+                    self.on_progress_pct(pct)
+                    self.on_time_update(self._fmt_duration(elapsed), self._fmt_duration(eta))
+
+                return detected_lang, out_txt, out_srt, out_plain
 
             try:
                 detected_lang, lines_txt, lines_srt, plain_text = run_pass(device)
@@ -478,6 +474,10 @@ class App(tk.Tk):
                                    fg=self.colors["accent"], font=(FONT_FAMILY, 12, "bold"))
         self.pct_label.pack(side="right")
 
+        self.time_label = tk.Label(top, text="", bg=self.colors["panel"],
+                                    fg=self.colors["text_muted"], font=(FONT_FAMILY, 9))
+        self.time_label.pack(side="right", padx=(0, 12))
+
         self.style.configure("Coral.Horizontal.TProgressbar", troughcolor=self.colors["track"],
                               background=self.colors["accent"], bordercolor=self.colors["track"],
                               lightcolor=self.colors["accent"], darkcolor=self.colors["accent"],
@@ -638,6 +638,7 @@ class App(tk.Tk):
         self.title_label.configure(bg=c["bg"], fg=c["text"])
         self.transcript_title.configure(bg=c["panel"], fg=c["text"])
         self.pct_label.configure(bg=c["panel"], fg=c["accent"])
+        self.time_label.configure(bg=c["panel"], fg=c["text_muted"])
         self.hint_label.configure(bg=c["panel"], fg=c["text_muted"])
         self.save_hint.configure(bg=c["panel"], fg=c["text_muted"])
         self.config_title.configure(bg=c["panel"], fg=c["text"])
@@ -716,6 +717,9 @@ class App(tk.Tk):
         self.progress_pct.set(pct)
         self.pct_label.configure(text=f"{pct}%")
 
+    def update_time_info(self, elapsed_str, eta_str):
+        self.time_label.configure(text=f"Transcurrido: {elapsed_str}  ·  Restante: ~{eta_str}")
+
     def start_transcription(self):
         filepath = self.filepath.get().strip()
         if not filepath or not os.path.isfile(filepath):
@@ -725,6 +729,7 @@ class App(tk.Tk):
         self.btn_run.set_enabled(False)
         self.transcript_text.delete("1.0", "end")
         self.update_progress(0)
+        self.time_label.configure(text="")
         self.set_status("Iniciando...")
         self._last_paths = None
 
@@ -742,6 +747,7 @@ class App(tk.Tk):
             on_done=lambda txt, srt, md: self.after(0, self.on_done, txt, srt, md),
             on_error=lambda err: self.after(0, self.on_error, err),
             on_clear=lambda: self.after(0, lambda: self.transcript_text.delete("1.0", "end")),
+            on_time_update=lambda elapsed, eta: self.after(0, self.update_time_info, elapsed, eta),
         )
         worker.start()
 
