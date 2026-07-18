@@ -245,8 +245,31 @@ class TranscriberWorker(threading.Thread):
                 finally:
                     whisper_transcribe_module.print = print
 
+                self.on_status(f"Segmentos capturados en vivo: {len(collected)}")
+
+                # Fuente autoritativa: siempre usamos result["segments"], que
+                # la librería garantiza completo, sin importar si el "modo en
+                # vivo" (interceptar el print interno) logró mostrar algo o
+                # no. Así los archivos finales nunca quedan vacíos.
+                final_segments = result.get("segments", [])
+
+                if not collected and final_segments:
+                    # El hook en vivo no capturó nada (por ejemplo, por una
+                    # diferencia interna de la librería) -> mostramos todo
+                    # de una vez como respaldo, en vez de dejar el panel vacío.
+                    self.on_status(
+                        "El modo en vivo no capturó texto; mostrando el "
+                        "resultado completo ahora."
+                    )
+                    for seg in final_segments:
+                        start_fmt = format_timestamp_txt(seg["start"])
+                        end_fmt = format_timestamp_txt(seg["end"])
+                        self.on_segment(seg["text"].strip(), start_fmt, end_fmt)
+                    self.on_progress_pct(100)
+
                 out_txt, out_srt, out_plain = [], [], []
-                for i, (start_sec, end_sec, text) in enumerate(collected, start=1):
+                for i, seg in enumerate(final_segments, start=1):
+                    start_sec, end_sec, text = seg["start"], seg["end"], seg["text"].strip()
                     start_fmt = format_timestamp_txt(start_sec)
                     end_fmt = format_timestamp_txt(end_sec)
                     out_txt.append(f"[{start_fmt} --> {end_fmt}] {text}")
