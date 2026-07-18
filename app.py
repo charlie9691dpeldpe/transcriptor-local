@@ -23,6 +23,20 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
 
+# Sin esto, Windows asume que la app "no sabe" de pantallas de alta
+# resolución (DPI) y la escala estirando los píxeles -- por eso se ve
+# borrosa/pixelada en monitores 4K o de alta densidad. Hay que avisarle a
+# Windows ANTES de crear cualquier ventana.
+if sys.platform == "win32":
+    import ctypes
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-Monitor-V2
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -76,6 +90,68 @@ MODEL_SIZE_LABEL = {
     "medium": "~1.5 GB",
     "large-v3": "~3 GB",
 }
+
+
+# --------------------------------------------------------------------------
+# Detección y extracción de pistas de audio específicas.
+# Whisper por defecto deja que ffmpeg elija automáticamente qué pista de
+# audio usar, lo cual puede mezclar/alternar entre pistas en videos con
+# doblaje múltiple. Aquí detectamos todas las pistas disponibles y permitimos
+# elegir una explícitamente con "-map 0:a:N".
+# --------------------------------------------------------------------------
+
+def probe_audio_tracks(filepath):
+    """Devuelve una lista de dicts {track_index, language, title} por cada
+    pista de audio del archivo, usando ffprobe. Si falla o solo hay una
+    pista, devuelve una lista de 0 o 1 elementos sin bloquear la app."""
+    import subprocess
+    import json
+
+    try:
+        cmd = [
+            "ffprobe", "-v", "error", "-select_streams", "a",
+            "-show_entries", "stream=index:stream_tags=language,title",
+            "-of", "json", filepath,
+        ]
+        creationflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+        out = subprocess.run(
+            cmd, capture_output=True, check=True, creationflags=creationflags
+        ).stdout
+        data = json.loads(out)
+        streams = data.get("streams", [])
+    except Exception:
+        return []
+
+    tracks = []
+    for i, s in enumerate(streams):
+        tags = s.get("tags", {}) or {}
+        tracks.append({
+            "track_index": i,
+            "language": tags.get("language"),
+            "title": tags.get("title"),
+        })
+    return tracks
+
+
+def load_audio_track(filepath, track_index=None, sr=16000):
+    """Extrae audio mono 16kHz float32 (formato que espera Whisper), igual
+    que whisper.audio.load_audio, pero permitiendo elegir una pista
+    específica con -map cuando el archivo tiene varias."""
+    import subprocess
+    import numpy as np
+
+    cmd = ["ffmpeg", "-nostdin", "-threads", "0", "-i", filepath]
+    if track_index is not None:
+        cmd += ["-map", f"0:a:{track_index}"]
+    cmd += ["-f", "s16le", "-ac", "1", "-acodec", "pcm_s16le", "-ar", str(sr), "-"]
+
+    creationflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+    proc = subprocess.run(cmd, capture_output=True, creationflags=creationflags)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg falló al extraer audio: {proc.stderr.decode(errors='ignore')[-500:]}"
+        )
+    return np.frombuffer(proc.stdout, np.int16).flatten().astype(np.float32) / 32768.0
 
 
 # --------------------------------------------------------------------------
@@ -139,7 +215,8 @@ class TranscriberWorker(threading.Thread):
 
     def __init__(self, filepath, model_size, language, use_gpu, out_dir,
                  on_status, on_segment, on_progress_pct, on_done, on_error,
-                 on_clear=None, on_time_update=None):
+                 on_clear=None, on_time_update=None, audio_track=None, translate=False,
+                 translate_to_spanish=False):
         super().__init__(daemon=True)
         self.filepath = filepath
         self.model_size = model_size
@@ -153,6 +230,9 @@ class TranscriberWorker(threading.Thread):
         self.on_error = on_error
         self.on_clear = on_clear or (lambda: None)
         self.on_time_update = on_time_update or (lambda elapsed, eta: None)
+        self.audio_track = audio_track
+        self.translate = translate
+        self.translate_to_spanish = translate_to_spanish
 
     CHUNK_SECONDS = 300  # procesar en bloques de 5 minutos
 
@@ -201,14 +281,47 @@ class TranscriberWorker(threading.Thread):
             _set_progress_callback(None)
 
             self.on_status("Cargando audio completo en memoria...")
-            audio_array = whisper_audio.load_audio(self.filepath)
             sr = whisper_audio.SAMPLE_RATE
+            if self.audio_track is not None:
+                self.on_status(f"Extrayendo pista de audio #{self.audio_track}...")
+                audio_array = load_audio_track(self.filepath, track_index=self.audio_track, sr=sr)
+            else:
+                audio_array = whisper_audio.load_audio(self.filepath)
             total_duration = len(audio_array) / sr
             self.on_status(f"Duración de audio detectada: {total_duration:.1f} segundos")
 
             chunk_samples = int(self.CHUNK_SECONDS * sr)
             total_samples = len(audio_array)
             num_chunks = max(1, math.ceil(total_samples / chunk_samples))
+
+            translator_state = {"model": None, "tok": None}
+
+            def translate_texts_to_spanish(texts, dev):
+                texts = [t for t in texts if t]
+                if not texts:
+                    return []
+                if translator_state["model"] is None:
+                    self.on_status(
+                        "Cargando modelo de traducción inglés→español "
+                        "(la primera vez descarga ~300MB)..."
+                    )
+                    from transformers import MarianMTModel, MarianTokenizer
+                    name = "Helsinki-NLP/opus-mt-en-es"
+                    translator_state["tok"] = MarianTokenizer.from_pretrained(
+                        name, cache_dir=models_dir
+                    )
+                    tmodel = MarianMTModel.from_pretrained(name, cache_dir=models_dir)
+                    if dev == "cuda":
+                        tmodel = tmodel.to("cuda")
+                    translator_state["model"] = tmodel
+                tok = translator_state["tok"]
+                tmodel = translator_state["model"]
+                inputs = tok(texts, return_tensors="pt", padding=True, truncation=True)
+                if dev == "cuda":
+                    inputs = {k: v.to("cuda") for k, v in inputs.items()}
+                with torch.no_grad():
+                    generated = tmodel.generate(**inputs, max_length=512)
+                return [tok.decode(t, skip_special_tokens=True).strip() for t in generated]
 
             def run_pass(dev):
                 self.on_status(f"Cargando modelo '{self.model_size}' en {dev.upper()}...")
@@ -237,12 +350,28 @@ class TranscriberWorker(threading.Thread):
                         fp16=(dev == "cuda"),
                         verbose=False,
                         initial_prompt=prev_text_tail,
+                        task="translate" if self.translate else "transcribe",
                     )
 
                     if detected_lang is None:
                         detected_lang = result.get("language")
 
                     chunk_segments = result.get("segments", [])
+
+                    if self.translate_to_spanish and chunk_segments:
+                        self.on_status(
+                            f"Traduciendo bloque {idx + 1} de {num_chunks} al español..."
+                        )
+                        texts_en = [seg["text"].strip() for seg in chunk_segments]
+                        try:
+                            texts_es = translate_texts_to_spanish(texts_en, dev)
+                            ei = 0
+                            for seg in chunk_segments:
+                                if seg["text"].strip():
+                                    seg["text"] = texts_es[ei]
+                                    ei += 1
+                        except Exception as tr_err:
+                            self.on_status(f"No se pudo traducir este bloque: {tr_err}")
                     for seg in chunk_segments:
                         start_sec = seg["start"] + chunk_offset
                         end_sec = seg["end"] + chunk_offset
@@ -303,20 +432,22 @@ class TranscriberWorker(threading.Thread):
             txt_path = out_dir / f"{base_name}_transcripcion.txt"
             srt_path = out_dir / f"{base_name}_transcripcion.srt"
             md_path = out_dir / f"{base_name}_transcripcion.md"
+            plain_txt_path = out_dir / f"{base_name}_texto_plano.txt"
 
             txt_path.write_text("\n".join(lines_txt), encoding="utf-8")
             srt_path.write_text("\n".join(lines_srt), encoding="utf-8")
+            plain_txt_path.write_text("\n".join(plain_text), encoding="utf-8")
 
             md_content = (
                 f"# Transcripción: {base_name}\n\n"
                 f"- Idioma detectado/usado: {detected_lang or 'desconocido'}\n"
                 f"- Modelo: {self.model_size}\n\n"
-                f"## Texto completo\n\n{' '.join(plain_text)}\n"
+                f"## Texto completo\n\n{chr(10).join(plain_text)}\n"
             )
             md_path.write_text(md_content, encoding="utf-8")
 
             self.on_progress_pct(100)
-            self.on_done(str(txt_path), str(srt_path), str(md_path))
+            self.on_done(str(txt_path), str(srt_path), str(md_path), str(plain_txt_path))
         except Exception as e:
             self.on_error(f"{e}\n\n{traceback.format_exc()}")
 
@@ -355,7 +486,7 @@ class RoundedButton(tk.Canvas):
 
     def _draw(self, color):
         self.delete("all")
-        self._round_rect(2, 2, self.width - 2, self.height - 2, 10, fill=color, outline="")
+        self._round_rect(2, 2, self.width - 2, self.height - 2, 12, fill=color, outline="")
         text_color = "white" if self.use_accent else self.colors["text"]
         self.create_text(self.width / 2, self.height / 2, text=self.text,
                           fill=text_color, font=(FONT_FAMILY, 10, "bold"))
@@ -380,18 +511,32 @@ class RoundedButton(tk.Canvas):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+
+        # Con la ventana ya reconocida como DPI-aware por Windows, hay que
+        # decirle a Tk el factor de escala real de la pantalla, o los
+        # textos/widgets quedarían diminutos en monitores de alta densidad.
+        try:
+            dpi_scale = self.winfo_fpixels("1i") / 72.0
+            self.tk.call("tk", "scaling", dpi_scale)
+        except Exception:
+            pass
+
         self.title(APP_TITLE)
         self.geometry("1150x720")
         self.minsize(900, 560)
 
-        self.theme_name = "light"
-        self.colors = LIGHT
+        self.theme_name = "dark"
+        self.colors = DARK
 
         self.filepath = tk.StringVar()
         self.out_dir = tk.StringVar(value=str(Path.home() / "Transcripciones"))
         self.model_size = tk.StringVar(value="large-v3")
         self.language_label = tk.StringVar(value="Detectar automáticamente")
         self.use_gpu = tk.BooleanVar(value=True)
+        self.translate_to_english = tk.BooleanVar(value=False)
+        self.translate_to_spanish = tk.BooleanVar(value=False)
+        self.selected_audio_track = None
+        self.audio_tracks_info = []
         self.progress_pct = tk.IntVar(value=0)
         self._last_paths = None
 
@@ -503,12 +648,15 @@ class App(tk.Tk):
             text_frame, wrap="word", bg=self.colors["surface"], fg=self.colors["text"],
             font=(FONT_FAMILY, 11), relief="flat", padx=12, pady=12,
             insertbackground=self.colors["text"], yscrollcommand=scrollbar.set,
+            undo=True, autoseparators=True, maxundo=-1,
         )
         self.transcript_text.pack(fill="both", expand=True)
         scrollbar.config(command=self.transcript_text.yview)
         self.transcript_text.tag_configure("timestamp", foreground=self.colors["accent"],
                                             font=(FONT_FAMILY, 9, "bold"))
         self._surface_widgets.append(self.transcript_text)
+        self._bind_text_edit_shortcuts(self.transcript_text)
+        self._add_text_context_menu(self.transcript_text)
 
         btn_row = self._panel_frame(card)
         btn_row.pack(fill="x", padx=16, pady=(0, 14))
@@ -546,16 +694,34 @@ class App(tk.Tk):
         field_label("Archivo de audio/video", card)
         file_row = self._panel_frame(card)
         file_row.pack(fill="x", padx=16)
-        ttk.Entry(file_row, textvariable=self.filepath).pack(side="left", fill="x", expand=True, ipady=3)
+        file_entry = ttk.Entry(file_row, textvariable=self.filepath)
+        file_entry.pack(side="left", fill="x", expand=True, ipady=3)
+        self._add_entry_context_menu(file_entry)
         b1 = RoundedButton(file_row, "Examinar", self.pick_file, self.colors, self.colors["panel"],
                             width=100, height=30)
         b1.pack(side="left", padx=(8, 0))
         self._round_buttons_accent.append(b1)
 
+        track_row = self._panel_frame(card)
+        track_row.pack(fill="x", padx=16, pady=(2, 0))
+        self.track_info_label = tk.Label(
+            track_row, text="", bg=self.colors["panel"], fg=self.colors["text_muted"],
+            font=(FONT_FAMILY, 8), wraplength=280, justify="left"
+        )
+        self.track_info_label.pack(side="left")
+        self.btn_change_track = RoundedButton(
+            track_row, "Cambiar pista", self.open_track_selector,
+            self.colors, self.colors["panel"], width=110, height=24, use_accent=False
+        )
+        # Solo se muestra cuando hay más de una pista de audio detectada
+        self._round_buttons_plain_panel.append(self.btn_change_track)
+
         field_label("Carpeta de salida", card)
         out_row = self._panel_frame(card)
         out_row.pack(fill="x", padx=16)
-        ttk.Entry(out_row, textvariable=self.out_dir).pack(side="left", fill="x", expand=True, ipady=3)
+        out_entry = ttk.Entry(out_row, textvariable=self.out_dir)
+        out_entry.pack(side="left", fill="x", expand=True, ipady=3)
+        self._add_entry_context_menu(out_entry)
         b2 = RoundedButton(out_row, "Elegir", self.pick_out_dir, self.colors, self.colors["panel"],
                             width=100, height=30)
         b2.pack(side="left", padx=(8, 0))
@@ -580,6 +746,34 @@ class App(tk.Tk):
         gpu_row.pack(fill="x", padx=16, pady=(14, 4))
         ttk.Checkbutton(gpu_row, text="Usar GPU (NVIDIA/CUDA) si está disponible",
                          variable=self.use_gpu).pack(anchor="w")
+
+        translate_row = self._panel_frame(card)
+        translate_row.pack(fill="x", padx=16, pady=(4, 4))
+        ttk.Checkbutton(
+            translate_row, text="Traducir al inglés (subtítulos)",
+            variable=self.translate_to_english
+        ).pack(anchor="w")
+        translate_hint = tk.Label(
+            translate_row, text="Traduce el audio original al inglés (solo hacia inglés).",
+            bg=self.colors["panel"], fg=self.colors["text_muted"], font=(FONT_FAMILY, 8)
+        )
+        translate_hint.pack(anchor="w")
+
+        translate_es_row = self._panel_frame(card)
+        translate_es_row.pack(fill="x", padx=16, pady=(4, 4))
+        ttk.Checkbutton(
+            translate_es_row, text="Traducir texto en inglés al español",
+            variable=self.translate_to_spanish
+        ).pack(anchor="w")
+        translate_es_hint = tk.Label(
+            translate_es_row,
+            text=("Requiere que el resultado esté en inglés (audio en inglés, o marca "
+                  "también \"Traducir al inglés\" si el audio es de otro idioma). "
+                  "Descarga un modelo adicional (~300MB) la primera vez."),
+            bg=self.colors["panel"], fg=self.colors["text_muted"], font=(FONT_FAMILY, 8),
+            wraplength=320, justify="left"
+        )
+        translate_es_hint.pack(anchor="w")
 
         run_row = self._panel_frame(card)
         run_row.pack(fill="x", padx=16, pady=(18, 10))
@@ -682,6 +876,65 @@ class App(tk.Tk):
     # ---------------------------------------------------------------
     # Acciones
     # ---------------------------------------------------------------
+    def _bind_text_edit_shortcuts(self, widget):
+        """Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z para deshacer/rehacer en un widget Text."""
+        widget.bind("<Control-z>", lambda e: (widget.event_generate("<<Undo>>"), "break"))
+        widget.bind("<Control-y>", lambda e: (widget.event_generate("<<Redo>>"), "break"))
+        widget.bind("<Control-Shift-Z>", lambda e: (widget.event_generate("<<Redo>>"), "break"))
+
+    def _add_text_context_menu(self, widget):
+        """Menú de clic derecho con deshacer/rehacer/cortar/copiar/pegar para un Text."""
+        menu = tk.Menu(widget, tearoff=0)
+        menu.add_command(label="Deshacer", command=lambda: widget.event_generate("<<Undo>>"))
+        menu.add_command(label="Rehacer", command=lambda: widget.event_generate("<<Redo>>"))
+        menu.add_separator()
+        menu.add_command(label="Cortar", command=lambda: widget.event_generate("<<Cut>>"))
+        menu.add_command(label="Copiar", command=lambda: widget.event_generate("<<Copy>>"))
+        menu.add_command(label="Pegar", command=lambda: widget.event_generate("<<Paste>>"))
+
+        def show_menu(event):
+            widget.focus_set()
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        widget.bind("<Button-3>", show_menu)
+        return menu
+
+    def _add_entry_context_menu(self, widget):
+        """Menú de clic derecho con cortar/copiar/pegar para un Entry (rutas/carpetas)."""
+        menu = tk.Menu(widget, tearoff=0)
+        menu.add_command(label="Cortar", command=lambda: widget.event_generate("<<Cut>>"))
+        menu.add_command(label="Copiar", command=lambda: widget.event_generate("<<Copy>>"))
+        menu.add_command(label="Pegar", command=lambda: widget.event_generate("<<Paste>>"))
+
+        def show_menu(event):
+            widget.focus_set()
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        widget.bind("<Button-3>", show_menu)
+        return menu
+
+    def _refresh_track_indicator(self):
+        if len(self.audio_tracks_info) > 1:
+            selected = self.selected_audio_track
+            if selected is None:
+                self.track_info_label.configure(text="Varias pistas de audio detectadas — elige una.")
+            else:
+                track = next(
+                    (t for t in self.audio_tracks_info if t["track_index"] == selected), None
+                )
+                lang = (track or {}).get("language") or "desconocido"
+                self.track_info_label.configure(text=f"Usando pista #{selected} (idioma: {lang})")
+            self.btn_change_track.pack(side="left", padx=(8, 0))
+        else:
+            self.track_info_label.configure(text="")
+            self.btn_change_track.pack_forget()
+
     def pick_file(self):
         path = filedialog.askopenfilename(
             title="Selecciona un archivo de audio o video",
@@ -692,6 +945,58 @@ class App(tk.Tk):
         )
         if path:
             self.filepath.set(path)
+            self.selected_audio_track = None
+            self.audio_tracks_info = probe_audio_tracks(path)
+            self._refresh_track_indicator()
+            if len(self.audio_tracks_info) > 1:
+                self.open_track_selector()
+
+    def open_track_selector(self):
+        c = self.colors
+        win = tk.Toplevel(self)
+        win.title("Seleccionar pista de audio")
+        win.configure(bg=c["bg"])
+        win.geometry("480x360")
+        win.minsize(420, 300)
+        win.transient(self)
+        win.grab_set()
+
+        tk.Label(
+            win, text="Este video tiene varias pistas de audio", bg=c["bg"], fg=c["text"],
+            font=(FONT_FAMILY, 13, "bold")
+        ).pack(anchor="w", padx=18, pady=(18, 4))
+        tk.Label(
+            win, text="Elige cuál quieres transcribir (evita mezclar idiomas):",
+            bg=c["bg"], fg=c["text_muted"], font=(FONT_FAMILY, 9)
+        ).pack(anchor="w", padx=18, pady=(0, 12))
+
+        rows = tk.Frame(win, bg=c["bg"])
+        rows.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+
+        def choose(track_index):
+            self.selected_audio_track = track_index
+            self.set_status(f"Pista de audio seleccionada: #{track_index}")
+            self._refresh_track_indicator()
+            win.destroy()
+
+        for track in self.audio_tracks_info:
+            idx = track["track_index"]
+            lang = track.get("language") or "desconocido"
+            title = track.get("title") or ""
+            label = f"Pista {idx} — idioma: {lang}"
+            if title:
+                label += f" ({title})"
+
+            outer = tk.Frame(rows, bg=c["border"])
+            outer.pack(fill="x", pady=5)
+            row = tk.Frame(outer, bg=c["panel"])
+            row.pack(fill="both", expand=True, padx=1, pady=1)
+
+            tk.Label(row, text=label, bg=c["panel"], fg=c["text"],
+                     font=(FONT_FAMILY, 10)).pack(side="left", padx=12, pady=10)
+            btn = RoundedButton(row, "Usar esta", lambda i=idx: choose(i),
+                                 c, c["panel"], width=100, height=30)
+            btn.pack(side="right", padx=12, pady=10)
 
     def pick_out_dir(self):
         path = filedialog.askdirectory(title="Selecciona carpeta de salida")
@@ -744,20 +1049,24 @@ class App(tk.Tk):
             on_status=lambda msg: self.after(0, self.set_status, msg),
             on_segment=lambda text, start, end: self.after(0, self.append_segment, text, start, end),
             on_progress_pct=lambda pct: self.after(0, self.update_progress, pct),
-            on_done=lambda txt, srt, md: self.after(0, self.on_done, txt, srt, md),
+            on_done=lambda txt, srt, md, plain: self.after(0, self.on_done, txt, srt, md, plain),
             on_error=lambda err: self.after(0, self.on_error, err),
             on_clear=lambda: self.after(0, lambda: self.transcript_text.delete("1.0", "end")),
             on_time_update=lambda elapsed, eta: self.after(0, self.update_time_info, elapsed, eta),
+            audio_track=self.selected_audio_track,
+            translate=self.translate_to_english.get(),
+            translate_to_spanish=self.translate_to_spanish.get(),
         )
         worker.start()
 
-    def on_done(self, txt_path, srt_path, md_path):
+    def on_done(self, txt_path, srt_path, md_path, plain_txt_path):
         self.btn_run.set_enabled(True)
         self.set_status("¡Transcripción completada!")
-        self._last_paths = (txt_path, srt_path, md_path)
-        self.log(f"TXT: {txt_path}")
+        self._last_paths = (txt_path, srt_path, md_path, plain_txt_path)
+        self.log(f"TXT (con tiempos): {txt_path}")
         self.log(f"SRT: {srt_path}")
         self.log(f"MD:  {md_path}")
+        self.log(f"TXT (texto plano): {plain_txt_path}")
         messagebox.showinfo(APP_TITLE, f"Transcripción completada.\n\nArchivos guardados en:\n{Path(txt_path).parent}")
 
     def on_error(self, error_message):
@@ -770,17 +1079,18 @@ class App(tk.Tk):
         if not self._last_paths:
             messagebox.showwarning(APP_TITLE, "Todavía no hay una transcripción generada para guardar.")
             return
-        txt_path, srt_path, md_path = self._last_paths
+        txt_path, srt_path, md_path, plain_txt_path = self._last_paths
         content = self.transcript_text.get("1.0", "end").strip()
 
         Path(txt_path).write_text(content, encoding="utf-8")
 
-        plain = " ".join(line.split("] ", 1)[-1] for line in content.splitlines() if line.strip())
+        plain = "\n".join(line.split("] ", 1)[-1] for line in content.splitlines() if line.strip())
         md_text = Path(md_path).read_text(encoding="utf-8") if Path(md_path).exists() else ""
         header = md_text.split("## Texto completo")[0] if "## Texto completo" in md_text else ""
         Path(md_path).write_text(header + "## Texto completo\n\n" + plain + "\n", encoding="utf-8")
+        Path(plain_txt_path).write_text(plain, encoding="utf-8")
 
-        self.set_status("Cambios guardados en los archivos .txt y .md")
+        self.set_status("Cambios guardados en los archivos .txt, .md y texto plano")
         messagebox.showinfo(APP_TITLE, "Cambios guardados correctamente.")
 
     # ---------------------------------------------------------------
