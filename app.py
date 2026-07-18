@@ -78,6 +78,49 @@ MODEL_SIZE_LABEL = {
 
 
 # --------------------------------------------------------------------------
+# Puente de progreso global: en vez de adivinar cómo cada librería importó
+# `tqdm` internamente (frágil, cambia entre versiones), parcheamos el
+# método `update` de la propia CLASE tqdm.tqdm una sola vez. Como todas las
+# formas de importar ("import tqdm" o "from tqdm import tqdm") terminan
+# apuntando al mismo objeto de clase, este parche funciona sin importar
+# cómo lo use la librería por dentro.
+# --------------------------------------------------------------------------
+_TQDM_PATCHED = False
+_progress_callback_holder = {"callback": None}
+
+
+def _install_tqdm_progress_hook():
+    global _TQDM_PATCHED
+    if _TQDM_PATCHED:
+        return
+    try:
+        import tqdm as tqdm_pkg
+        original_update = tqdm_pkg.tqdm.update
+
+        def patched_update(self, n=1):
+            result = original_update(self, n)
+            cb = _progress_callback_holder["callback"]
+            if cb:
+                try:
+                    total = getattr(self, "total", None) or 1
+                    current = getattr(self, "n", 0)
+                    pct = min(100, int(current / total * 100))
+                    cb(pct)
+                except Exception:
+                    pass
+            return result
+
+        tqdm_pkg.tqdm.update = patched_update
+        _TQDM_PATCHED = True
+    except Exception:
+        pass
+
+
+def _set_progress_callback(callback):
+    _progress_callback_holder["callback"] = callback
+
+
+# --------------------------------------------------------------------------
 # Lógica de transcripción (hilo aparte)
 # --------------------------------------------------------------------------
 
@@ -94,7 +137,7 @@ class TranscriberWorker(threading.Thread):
     """
 
     def __init__(self, filepath, model_size, language, use_gpu, out_dir,
-                 on_status, on_segment, on_progress_pct, on_done, on_error):
+                 on_status, on_segment, on_progress_pct, on_done, on_error, on_clear=None):
         super().__init__(daemon=True)
         self.filepath = filepath
         self.model_size = model_size
@@ -106,17 +149,27 @@ class TranscriberWorker(threading.Thread):
         self.on_progress_pct = on_progress_pct
         self.on_done = on_done
         self.on_error = on_error
+        self.on_clear = on_clear or (lambda: None)
 
     def run(self):
         try:
             self.on_status("Cargando motor de transcripción (Whisper + PyTorch)...")
             import whisper
             import torch
-            import whisper.transcribe as whisper_transcribe_module
 
             device = "cpu"
             if self.use_gpu:
-                if torch.cuda.is_available():
+                cuda_ok = torch.cuda.is_available()
+                self.on_status(
+                    f"Diagnóstico GPU -> torch.cuda.is_available(): {cuda_ok} | "
+                    f"CUDA build de PyTorch: {torch.version.cuda}"
+                )
+                if cuda_ok:
+                    try:
+                        gpu_name = torch.cuda.get_device_name(0)
+                        self.on_status(f"GPU detectada: {gpu_name}")
+                    except Exception as diag_err:
+                        self.on_status(f"GPU detectada pero no se pudo leer el nombre: {diag_err}")
                     device = "cuda"
                 else:
                     self.on_status("No se detectó GPU compatible. Usando CPU...")
@@ -128,65 +181,79 @@ class TranscriberWorker(threading.Thread):
             models_dir = str(base_dir / "models")
             os.makedirs(models_dir, exist_ok=True)
 
-            outer_self = self
+            # No usamos el parche de tqdm para la transcripción (activar
+            # verbose=True, necesario para el streaming en vivo, desactiva
+            # la barra de progreso interna). En su lugar calculamos el %
+            # nosotros mismos según el timestamp del último segmento vs.
+            # la duración total del audio.
+            _set_progress_callback(None)
 
-            class _ProgressBridge:
-                """Reemplaza la barra tqdm interna de whisper para reportar % real."""
-                def __init__(self, total=0, unit=None, disable=False, **kwargs):
-                    self.total = total or 1
-                    self.n = 0
+            self.on_status("Calculando duración del audio...")
+            import whisper.audio as whisper_audio
+            try:
+                audio_array = whisper_audio.load_audio(self.filepath)
+                total_duration = len(audio_array) / whisper_audio.SAMPLE_RATE
+            except Exception:
+                total_duration = 0
 
-                def update(self, n):
-                    self.n += n
-                    pct = min(100, int(self.n / self.total * 100))
-                    outer_self.on_progress_pct(pct)
+            import re as _re
+            ts_line_re = _re.compile(r"^\[(.+?) --> (.+?)\] (.*)$")
 
-                def __enter__(self):
-                    return self
-
-                def __exit__(self, *exc):
-                    return False
-
-                def close(self):
-                    pass
-
-            def _patch_progress(module, bridge_cls):
-                """Reemplaza la barra tqdm que usa `module` internamente, sin importar
-                si esa lib la importó como `import tqdm` o `from tqdm import tqdm`."""
-                current = getattr(module, "tqdm", None)
-                if current is not None and hasattr(current, "tqdm"):
-                    # Estilo "import tqdm" -> module.tqdm es el submódulo, .tqdm es la clase
-                    current.tqdm = bridge_cls
-                else:
-                    # Estilo "from tqdm import tqdm" -> module.tqdm ya es la clase/función
-                    module.tqdm = bridge_cls
-
-            _patch_progress(whisper_transcribe_module, _ProgressBridge)
+            def _parse_ts_to_seconds(ts):
+                parts = [float(p) for p in ts.split(":")]
+                while len(parts) < 3:
+                    parts.insert(0, 0.0)
+                h, mnt, s = parts
+                return h * 3600 + mnt * 60 + s
 
             def run_pass(dev):
                 self.on_status(f"Cargando modelo '{self.model_size}' en {dev.upper()}...")
                 m = whisper.load_model(self.model_size, device=dev, download_root=models_dir)
                 self.on_status(f"Transcribiendo en {dev.upper()}... esto puede tardar unos minutos.")
-                result = m.transcribe(
-                    self.filepath,
-                    language=self.language,
-                    fp16=(dev == "cuda"),
-                    verbose=False,
-                )
-                segs = result.get("segments", [])
+
+                collected = []
+
+                import whisper.transcribe as whisper_transcribe_module
+
+                def _live_print(*args, **kwargs):
+                    try:
+                        line = str(args[0]) if args else ""
+                        match = ts_line_re.match(line)
+                        if match:
+                            start_str, end_str, text = match.group(1), match.group(2), match.group(3)
+                            start_sec = _parse_ts_to_seconds(start_str)
+                            end_sec = _parse_ts_to_seconds(end_str)
+                            text = text.strip()
+                            collected.append((start_sec, end_sec, text))
+                            start_fmt = format_timestamp_txt(start_sec)
+                            end_fmt = format_timestamp_txt(end_sec)
+                            self.on_segment(text, start_fmt, end_fmt)
+                            if total_duration > 0:
+                                pct = min(100, int(end_sec / total_duration * 100))
+                                self.on_progress_pct(pct)
+                    except Exception:
+                        pass
+
+                whisper_transcribe_module.print = _live_print
+                try:
+                    result = m.transcribe(
+                        self.filepath,
+                        language=self.language,
+                        fp16=(dev == "cuda"),
+                        verbose=True,
+                    )
+                finally:
+                    whisper_transcribe_module.print = print
+
                 out_txt, out_srt, out_plain = [], [], []
-                for i, seg in enumerate(segs, start=1):
-                    start = format_timestamp_txt(seg["start"])
-                    end = format_timestamp_txt(seg["end"])
-                    text = seg["text"].strip()
-                    out_txt.append(f"[{start} --> {end}] {text}")
+                for i, (start_sec, end_sec, text) in enumerate(collected, start=1):
+                    start_fmt = format_timestamp_txt(start_sec)
+                    end_fmt = format_timestamp_txt(end_sec)
+                    out_txt.append(f"[{start_fmt} --> {end_fmt}] {text}")
                     out_plain.append(text)
-
-                    srt_start = format_timestamp_srt(seg["start"])
-                    srt_end = format_timestamp_srt(seg["end"])
-                    out_srt.append(f"{i}\n{srt_start} --> {srt_end}\n{text}\n")
-
-                    self.on_segment(text, start, end)
+                    out_srt.append(
+                        f"{i}\n{format_timestamp_srt(start_sec)} --> {format_timestamp_srt(end_sec)}\n{text}\n"
+                    )
                 return result.get("language", self.language), out_txt, out_srt, out_plain
 
             try:
@@ -196,12 +263,16 @@ class TranscriberWorker(threading.Thread):
                 gpu_related = any(
                     kw in error_text for kw in ("cuda", "dll", "library", "driver", "gpu")
                 )
+                if device == "cuda":
+                    self.on_status(f"Detalle del error de GPU: {gpu_err}")
                 if device == "cuda" and gpu_related:
                     self.on_status(
                         "La GPU falló al procesar (revisa que el driver esté al día). "
                         "Reintentando automáticamente en CPU..."
                     )
                     device = "cpu"
+                    self.on_clear()
+                    self.on_progress_pct(0)
                     detected_lang, lines_txt, lines_srt, plain_text = run_pass(device)
                 else:
                     raise
@@ -647,6 +718,7 @@ class App(tk.Tk):
             on_progress_pct=lambda pct: self.after(0, self.update_progress, pct),
             on_done=lambda txt, srt, md: self.after(0, self.on_done, txt, srt, md),
             on_error=lambda err: self.after(0, self.on_error, err),
+            on_clear=lambda: self.after(0, lambda: self.transcript_text.delete("1.0", "end")),
         )
         worker.start()
 
@@ -795,28 +867,8 @@ class App(tk.Tk):
         def _run():
             try:
                 import whisper
-                outer_self = self
-
-                class _ProgressBridge:
-                    def __init__(self, total=0, **kwargs):
-                        self.total = total or 1
-                        self.n = 0
-
-                    def update(self, n):
-                        self.n += n
-                        pct = min(100, int(self.n / self.total * 100))
-                        on_progress(pct)
-
-                    def __enter__(self):
-                        return self
-
-                    def __exit__(self, *exc):
-                        return False
-
-                    def close(self):
-                        pass
-
-                whisper.tqdm = _ProgressBridge
+                _install_tqdm_progress_hook()
+                _set_progress_callback(on_progress)
                 whisper._download(whisper._MODELS[name], str(self.get_models_dir()), False)
                 on_done()
             except Exception as e:
