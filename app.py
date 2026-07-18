@@ -12,6 +12,16 @@ import traceback
 from datetime import timedelta
 from pathlib import Path
 
+# En builds compilados con --windowed (sin consola), Windows deja sys.stdout
+# y sys.stderr en None. Cualquier librería que intente escribir ahí (tqdm,
+# warnings internos de torch/whisper, etc.) se cae con un AttributeError a
+# mitad de una operación -- por ejemplo, a mitad de descargar un modelo,
+# dejando el archivo corrupto. Este parche evita ese problema de raíz.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -810,6 +820,15 @@ class App(tk.Tk):
                 whisper._download(whisper._MODELS[name], str(self.get_models_dir()), False)
                 on_done()
             except Exception as e:
+                # Si algo falló a mitad de la descarga, el archivo puede haber
+                # quedado a medias/corrupto. Lo borramos para evitar errores
+                # confusos más adelante al intentar usarlo.
+                try:
+                    partial = self.model_file_path(name)
+                    if partial.exists():
+                        partial.unlink()
+                except Exception:
+                    pass
                 on_error(str(e))
 
         threading.Thread(target=_run, daemon=True).start()
