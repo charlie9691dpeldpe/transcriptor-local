@@ -140,7 +140,18 @@ class TranscriberWorker(threading.Thread):
                 def close(self):
                     pass
 
-            whisper_transcribe_module.tqdm.tqdm = _ProgressBridge
+            def _patch_progress(module, bridge_cls):
+                """Reemplaza la barra tqdm que usa `module` internamente, sin importar
+                si esa lib la importó como `import tqdm` o `from tqdm import tqdm`."""
+                current = getattr(module, "tqdm", None)
+                if current is not None and hasattr(current, "tqdm"):
+                    # Estilo "import tqdm" -> module.tqdm es el submódulo, .tqdm es la clase
+                    current.tqdm = bridge_cls
+                else:
+                    # Estilo "from tqdm import tqdm" -> module.tqdm ya es la clase/función
+                    module.tqdm = bridge_cls
+
+            _patch_progress(whisper_transcribe_module, _ProgressBridge)
 
             def run_pass(dev):
                 self.on_status(f"Cargando modelo '{self.model_size}' en {dev.upper()}...")
