@@ -58,6 +58,13 @@ LANGUAGE_MAP = {
     "Inglés": "en",
 }
 MODEL_OPTIONS = ["tiny", "base", "small", "medium", "large-v3"]
+MODEL_SIZE_LABEL = {
+    "tiny": "~75 MB",
+    "base": "~145 MB",
+    "small": "~480 MB",
+    "medium": "~1.5 GB",
+    "large-v3": "~3 GB",
+}
 
 
 # --------------------------------------------------------------------------
@@ -285,6 +292,7 @@ class App(tk.Tk):
         self._log_widgets = []
         self._round_buttons_accent = []
         self._round_buttons_plain = []
+        self._round_buttons_plain_panel = []
         self._canvases_bg = []      # canvases cuyo fondo es 'bg' (ej. el punto decorativo)
 
         self.configure(bg=self.colors["bg"])
@@ -439,8 +447,15 @@ class App(tk.Tk):
         self._round_buttons_accent.append(b2)
 
         field_label("Modelo", card)
-        ttk.Combobox(card, textvariable=self.model_size, values=MODEL_OPTIONS,
-                     state="readonly").pack(fill="x", padx=16)
+        model_row = self._panel_frame(card)
+        model_row.pack(fill="x", padx=16)
+        ttk.Combobox(model_row, textvariable=self.model_size, values=MODEL_OPTIONS,
+                     state="readonly").pack(side="left", fill="x", expand=True)
+        b_models = RoundedButton(model_row, "Gestionar modelos", self.open_model_manager,
+                                  self.colors, self.colors["panel"], width=150, height=30,
+                                  use_accent=False)
+        b_models.pack(side="left", padx=(8, 0))
+        self._round_buttons_plain_panel.append(b_models)
 
         field_label("Idioma", card)
         ttk.Combobox(card, textvariable=self.language_label,
@@ -541,6 +556,9 @@ class App(tk.Tk):
         for btn in self._round_buttons_plain:
             btn.colors = c
             btn.set_panel_bg(c["bg"])
+        for btn in self._round_buttons_plain_panel:
+            btn.colors = c
+            btn.set_panel_bg(c["panel"])
 
         self.theme_btn.text = "☀️ Modo claro" if self.theme_name == "dark" else "🌙 Modo oscuro"
         self.theme_btn._draw(self.theme_btn._fill_color())
@@ -642,6 +660,161 @@ class App(tk.Tk):
 
         self.set_status("Cambios guardados en los archivos .txt y .md")
         messagebox.showinfo(APP_TITLE, "Cambios guardados correctamente.")
+
+    # ---------------------------------------------------------------
+    # Gestor de modelos: descargar / eliminar modelos permanentemente
+    # junto al .exe, sin tener que precargarlos durante la compilación.
+    # ---------------------------------------------------------------
+    def get_models_dir(self) -> Path:
+        if getattr(sys, "frozen", False):
+            base_dir = Path(sys.executable).parent
+        else:
+            base_dir = Path(__file__).resolve().parent
+        d = base_dir / "models"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def model_file_path(self, name: str) -> Path:
+        import whisper
+        url = whisper._MODELS[name]
+        return self.get_models_dir() / os.path.basename(url)
+
+    def is_model_downloaded(self, name: str) -> bool:
+        try:
+            return self.model_file_path(name).exists()
+        except Exception:
+            return False
+
+    def open_model_manager(self):
+        c = self.colors
+        win = tk.Toplevel(self)
+        win.title("Gestor de modelos")
+        win.configure(bg=c["bg"])
+        win.geometry("560x460")
+        win.minsize(500, 380)
+        win.transient(self)
+
+        tk.Label(win, text="Modelos disponibles", bg=c["bg"], fg=c["text"],
+                 font=(FONT_FAMILY, 13, "bold")).pack(anchor="w", padx=18, pady=(18, 4))
+        tk.Label(win, text=f"Carpeta: {self.get_models_dir()}", bg=c["bg"], fg=c["text_muted"],
+                 font=(FONT_FAMILY, 8)).pack(anchor="w", padx=18, pady=(0, 10))
+
+        rows_container = tk.Frame(win, bg=c["bg"])
+        rows_container.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+
+        for name in MODEL_OPTIONS:
+            self._build_model_row(rows_container, name)
+
+    def _build_model_row(self, parent, name):
+        c = self.colors
+        outer = tk.Frame(parent, bg=c["border"])
+        outer.pack(fill="x", pady=5)
+        row = tk.Frame(outer, bg=c["panel"])
+        row.pack(fill="both", expand=True, padx=1, pady=1)
+
+        left = tk.Frame(row, bg=c["panel"])
+        left.pack(side="left", fill="both", expand=True, padx=12, pady=10)
+
+        name_lbl = tk.Label(left, text=f"{name}   ({MODEL_SIZE_LABEL.get(name, '')})",
+                             bg=c["panel"], fg=c["text"], font=(FONT_FAMILY, 10, "bold"))
+        name_lbl.pack(anchor="w")
+
+        downloaded = self.is_model_downloaded(name)
+        status_lbl = tk.Label(
+            left, text="Descargado" if downloaded else "No descargado",
+            bg=c["panel"], fg=(c["accent"] if downloaded else c["text_muted"]),
+            font=(FONT_FAMILY, 9),
+        )
+        status_lbl.pack(anchor="w")
+
+        right = tk.Frame(row, bg=c["panel"])
+        right.pack(side="right", padx=12, pady=10)
+
+        widgets = {"status_lbl": status_lbl, "btn": None}
+
+        def make_btn():
+            is_dl = self.is_model_downloaded(name)
+            label = "Eliminar" if is_dl else "Descargar"
+            action = (lambda: self.delete_model(name, widgets)) if is_dl else \
+                     (lambda: self.download_model(name, widgets))
+            btn = RoundedButton(right, label, action, c, c["panel"], width=110, height=30,
+                                 use_accent=not is_dl)
+            btn.pack()
+            widgets["btn"] = btn
+
+        make_btn()
+        widgets["make_btn"] = make_btn
+        widgets["right"] = right
+
+    def download_model(self, name, widgets):
+        widgets["btn"].destroy()
+        pct_lbl = tk.Label(widgets["right"], text="0%", bg=self.colors["panel"],
+                            fg=self.colors["accent"], font=(FONT_FAMILY, 9, "bold"))
+        pct_lbl.pack()
+        widgets["status_lbl"].configure(text="Descargando...", fg=self.colors["accent"])
+
+        def on_progress(pct):
+            self.after(0, lambda: pct_lbl.configure(text=f"{pct}%"))
+
+        def on_done():
+            def _finish():
+                pct_lbl.destroy()
+                widgets["status_lbl"].configure(text="Descargado", fg=self.colors["accent"])
+                widgets["make_btn"]()
+            self.after(0, _finish)
+
+        def on_error(err):
+            def _fail():
+                pct_lbl.destroy()
+                widgets["status_lbl"].configure(text="Error al descargar", fg=self.colors["text_muted"])
+                widgets["make_btn"]()
+                messagebox.showerror(APP_TITLE, f"No se pudo descargar el modelo:\n\n{err[:400]}")
+            self.after(0, _fail)
+
+        def _run():
+            try:
+                import whisper
+                outer_self = self
+
+                class _ProgressBridge:
+                    def __init__(self, total=0, **kwargs):
+                        self.total = total or 1
+                        self.n = 0
+
+                    def update(self, n):
+                        self.n += n
+                        pct = min(100, int(self.n / self.total * 100))
+                        on_progress(pct)
+
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *exc):
+                        return False
+
+                    def close(self):
+                        pass
+
+                whisper.tqdm = _ProgressBridge
+                whisper._download(whisper._MODELS[name], str(self.get_models_dir()), False)
+                on_done()
+            except Exception as e:
+                on_error(str(e))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def delete_model(self, name, widgets):
+        if not messagebox.askyesno(APP_TITLE, f"¿Eliminar el modelo '{name}' descargado?"):
+            return
+        try:
+            path = self.model_file_path(name)
+            if path.exists():
+                path.unlink()
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, f"No se pudo eliminar el modelo:\n\n{e}")
+            return
+        widgets["status_lbl"].configure(text="No descargado", fg=self.colors["text_muted"])
+        widgets["make_btn"]()
 
 
 if __name__ == "__main__":
