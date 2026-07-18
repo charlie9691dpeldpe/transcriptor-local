@@ -29,14 +29,8 @@ jobs:
       - name: Compilar con PyInstaller
         run: pyinstaller --noconfirm --onefile --windowed --name "TranscriptorLocal" --collect-data whisper --collect-all torch --collect-all tiktoken app.py
 
-      - name: Precargar modelos (large-v3 y medium)
-        run: |
-          mkdir dist\models
-          python -c "import whisper; whisper.load_model('large-v3', download_root='dist/models')"
-          python -c "import whisper; whisper.load_model('medium', download_root='dist/models')"
-
-      - name: Subir ejecutable + modelo como artefacto
+      - name: Subir ejecutable como artefacto
         uses: actions/upload-artifact@v4
         with:
           name: TranscriptorLocal-Windows
-          path: dist
+          path: dist/TranscriptorLocal.exe
