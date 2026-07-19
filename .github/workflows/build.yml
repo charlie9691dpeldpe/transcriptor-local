@@ -27,7 +27,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Compilar con PyInstaller
-        run: pyinstaller --noconfirm --onedir --windowed --name "TranscriptorLocal" --collect-data whisper --collect-all torch --collect-all tiktoken --collect-all transformers --collect-all sentencepiece app.py
+        run: pyinstaller --noconfirm --onedir --windowed --name "TranscriptorLocal" --collect-data whisper --collect-all torch --collect-all tiktoken --collect-all transformers --collect-all sentencepiece --collect-all bs4 --collect-all soupsieve --collect-all requests app.py
 
       - name: Subir carpeta de la app como artefacto
         uses: actions/upload-artifact@v4
