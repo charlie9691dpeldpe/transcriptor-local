@@ -2,3 +2,5 @@ openai-whisper
 pyinstaller>=6.0.0
 transformers
 sentencepiece
+requests
+beautifulsoup4
