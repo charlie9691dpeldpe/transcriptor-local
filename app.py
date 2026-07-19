@@ -607,6 +607,84 @@ class TranslateToSpanishWorker(threading.Thread):
             self.on_error(f"{e}\n\n{traceback.format_exc()}")
 
 
+class TextDocumentTranslateWorker(threading.Thread):
+    """Traduce un documento de texto cualquiera (no producido por la
+    transcripción), de forma independiente. target_lang: 'en' o 'es'."""
+
+    def __init__(self, text, target_lang, out_dir, base_name,
+                 on_status, on_progress_pct, on_done, on_error):
+        super().__init__(daemon=True)
+        self.text = text
+        self.target_lang = target_lang
+        self.out_dir = out_dir
+        self.base_name = base_name
+        self.on_status = on_status
+        self.on_progress_pct = on_progress_pct
+        self.on_done = on_done
+        self.on_error = on_error
+
+    def run(self):
+        try:
+            import torch
+
+            if getattr(sys, "frozen", False):
+                base_dir = Path(sys.executable).parent
+            else:
+                base_dir = Path(__file__).resolve().parent
+            models_dir = str(base_dir / "models")
+            os.makedirs(models_dir, exist_ok=True)
+
+            model_name = (
+                "Helsinki-NLP/opus-mt-es-en" if self.target_lang == "en"
+                else "Helsinki-NLP/opus-mt-en-es"
+            )
+            self.on_status(
+                f"Cargando modelo de traducción ({model_name.split('/')[-1]}) "
+                "(la primera vez descarga ~300MB)..."
+            )
+            from transformers import MarianMTModel, MarianTokenizer
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            tok = MarianTokenizer.from_pretrained(model_name, cache_dir=models_dir)
+            model = MarianMTModel.from_pretrained(model_name, cache_dir=models_dir)
+            if device == "cuda":
+                model = model.to("cuda")
+
+            lines = [l for l in self.text.splitlines() if l.strip()]
+            if not lines:
+                lines = [self.text.strip()]
+
+            translated_lines = []
+            batch_size = 16
+            total = len(lines)
+
+            for i in range(0, total, batch_size):
+                batch = lines[i:i + batch_size]
+                self.on_status(f"Traduciendo línea {i + len(batch)} de {total}...")
+                inputs = tok(batch, return_tensors="pt", padding=True, truncation=True)
+                if device == "cuda":
+                    inputs = {k: v.to("cuda") for k, v in inputs.items()}
+                with torch.no_grad():
+                    generated = model.generate(**inputs, max_length=512)
+                translated_lines.extend(
+                    tok.decode(t, skip_special_tokens=True).strip() for t in generated
+                )
+                self.on_progress_pct(min(100, int((i + len(batch)) / total * 100)))
+
+            translated_text = "\n".join(translated_lines)
+
+            out_dir = Path(self.out_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            suffix = "ingles" if self.target_lang == "en" else "espanol"
+            out_path = out_dir / f"{self.base_name}_traducido_{suffix}.txt"
+            out_path.write_text(translated_text, encoding="utf-8")
+
+            self.on_progress_pct(100)
+            self.on_done(translated_text, str(out_path))
+        except Exception as e:
+            self.on_error(f"{e}\n\n{traceback.format_exc()}")
+
+
 class RoundedButton(tk.Canvas):
     def __init__(self, parent, text, command, colors, panel_bg,
                  width=150, height=36, use_accent=True, **kwargs):
