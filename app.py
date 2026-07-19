@@ -685,6 +685,201 @@ class TextDocumentTranslateWorker(threading.Thread):
             self.on_error(f"{e}\n\n{traceback.format_exc()}")
 
 
+class WebsiteDownloaderWorker(threading.Thread):
+    """Descarga las páginas HTML de un sitio (mismo dominio), siguiendo
+    enlaces internos, hasta un límite de páginas. Solo HTML por ahora
+    (no imágenes/CSS/JS) -- pensado para poder traducir el contenido."""
+
+    def __init__(self, start_url, out_dir, page_limit,
+                 on_status, on_progress_pct, on_done, on_error):
+        super().__init__(daemon=True)
+        self.start_url = start_url
+        self.out_dir = out_dir
+        self.page_limit = max(1, page_limit)
+        self.on_status = on_status
+        self.on_progress_pct = on_progress_pct
+        self.on_done = on_done
+        self.on_error = on_error
+
+    @staticmethod
+    def _url_to_local_path(url, base_dir):
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        path = parsed.path or "/"
+        if path.endswith("/"):
+            path = path + "index.html"
+        if not os.path.splitext(path)[1]:
+            path = path + ".html"
+        return Path(base_dir) / parsed.netloc / path.lstrip("/")
+
+    def run(self):
+        try:
+            import requests
+            from bs4 import BeautifulSoup
+            from urllib.parse import urljoin, urlparse
+
+            start_url = self.start_url.strip()
+            if not start_url.startswith("http"):
+                start_url = "https://" + start_url
+            domain = urlparse(start_url).netloc
+            if not domain:
+                raise RuntimeError("La URL no parece válida.")
+
+            out_dir = Path(self.out_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            visited = set()
+            queue = [start_url]
+            saved_count = 0
+            headers = {"User-Agent": "Mozilla/5.0 (compatible; TranscriptorLocalBot/1.0)"}
+
+            while queue and saved_count < self.page_limit:
+                url = queue.pop(0)
+                if url in visited:
+                    continue
+                visited.add(url)
+
+                self.on_status(
+                    f"Descargando página {saved_count + 1} de {self.page_limit}: {url}"
+                )
+                try:
+                    resp = requests.get(url, headers=headers, timeout=15)
+                    resp.raise_for_status()
+                except Exception as fetch_err:
+                    self.on_status(f"No se pudo descargar {url}: {fetch_err}")
+                    continue
+
+                content_type = resp.headers.get("Content-Type", "")
+                if "text/html" not in content_type:
+                    continue
+
+                local_path = self._url_to_local_path(url, out_dir)
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                local_path.write_bytes(resp.content)
+                saved_count += 1
+
+                pct = min(100, int(saved_count / self.page_limit * 100))
+                self.on_progress_pct(pct)
+
+                try:
+                    soup = BeautifulSoup(resp.content, "html.parser")
+                    for a in soup.find_all("a", href=True):
+                        link = urljoin(url, a["href"])
+                        link = urlparse(link)._replace(fragment="").geturl()
+                        if urlparse(link).netloc == domain and link not in visited:
+                            queue.append(link)
+                except Exception:
+                    pass
+
+            self.on_progress_pct(100)
+            self.on_done(saved_count, str(out_dir))
+        except Exception as e:
+            self.on_error(f"{e}\n\n{traceback.format_exc()}")
+
+
+class WebsiteTranslateWorker(threading.Thread):
+    """Traduce todas las páginas .html de una carpeta (por ejemplo, un
+    sitio ya descargado con WebsiteDownloaderWorker), conservando la
+    estructura HTML y solo reemplazando el texto visible."""
+
+    def __init__(self, site_dir, target_lang, out_dir,
+                 on_status, on_progress_pct, on_done, on_error):
+        super().__init__(daemon=True)
+        self.site_dir = site_dir
+        self.target_lang = target_lang
+        self.out_dir = out_dir
+        self.on_status = on_status
+        self.on_progress_pct = on_progress_pct
+        self.on_done = on_done
+        self.on_error = on_error
+
+    def run(self):
+        try:
+            import torch
+            from bs4 import BeautifulSoup
+
+            if getattr(sys, "frozen", False):
+                base_dir = Path(sys.executable).parent
+            else:
+                base_dir = Path(__file__).resolve().parent
+            models_dir = str(base_dir / "models")
+            os.makedirs(models_dir, exist_ok=True)
+
+            model_name = (
+                "Helsinki-NLP/opus-mt-es-en" if self.target_lang == "en"
+                else "Helsinki-NLP/opus-mt-en-es"
+            )
+            self.on_status(
+                f"Cargando modelo de traducción ({model_name.split('/')[-1]}) "
+                "(la primera vez descarga ~300MB)..."
+            )
+            from transformers import MarianMTModel, MarianTokenizer
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            tok = MarianTokenizer.from_pretrained(model_name, cache_dir=models_dir)
+            model = MarianMTModel.from_pretrained(model_name, cache_dir=models_dir)
+            if device == "cuda":
+                model = model.to("cuda")
+
+            def translate_batch(texts):
+                texts = [t for t in texts if t.strip()]
+                if not texts:
+                    return {}
+                inputs = tok(texts, return_tensors="pt", padding=True, truncation=True)
+                if device == "cuda":
+                    inputs = {k: v.to("cuda") for k, v in inputs.items()}
+                with torch.no_grad():
+                    generated = model.generate(**inputs, max_length=512)
+                decoded = [tok.decode(t, skip_special_tokens=True).strip() for t in generated]
+                return dict(zip(texts, decoded))
+
+            site_dir = Path(self.site_dir)
+            html_files = list(site_dir.rglob("*.html")) + list(site_dir.rglob("*.htm"))
+            if not html_files:
+                raise RuntimeError("No se encontraron archivos .html en esa carpeta.")
+
+            suffix = "traducido_ingles" if self.target_lang == "en" else "traducido_espanol"
+            out_root = Path(self.out_dir) / f"{site_dir.name}_{suffix}"
+            out_root.mkdir(parents=True, exist_ok=True)
+
+            skip_tags = {"script", "style", "noscript", "code", "pre"}
+            total = len(html_files)
+
+            for i, html_file in enumerate(html_files, start=1):
+                rel = html_file.relative_to(site_dir)
+                self.on_status(f"Traduciendo página {i} de {total}: {rel}")
+
+                raw = html_file.read_text(encoding="utf-8", errors="ignore")
+                soup = BeautifulSoup(raw, "html.parser")
+
+                text_nodes = [
+                    node for node in soup.find_all(string=True)
+                    if node.parent.name not in skip_tags and node.strip()
+                ]
+                unique_texts = list({node.strip() for node in text_nodes})
+
+                translations = {}
+                batch_size = 16
+                for b in range(0, len(unique_texts), batch_size):
+                    translations.update(translate_batch(unique_texts[b:b + batch_size]))
+
+                for node in text_nodes:
+                    original = node.strip()
+                    if original in translations:
+                        node.replace_with(translations[original])
+
+                out_path = out_root / rel
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(str(soup), encoding="utf-8")
+
+                self.on_progress_pct(min(100, int(i / total * 100)))
+
+            self.on_progress_pct(100)
+            self.on_done(total, str(out_root))
+        except Exception as e:
+            self.on_error(f"{e}\n\n{traceback.format_exc()}")
+
+
 class RoundedButton(tk.Canvas):
     def __init__(self, parent, text, command, colors, panel_bg,
                  width=150, height=36, use_accent=True, **kwargs):
@@ -774,6 +969,11 @@ class App(tk.Tk):
         self._translation_cache = None
         self.doc_progress_pct = tk.IntVar(value=0)
         self.doc_filepath = tk.StringVar()
+        self.website_url = tk.StringVar()
+        self.website_out_dir = tk.StringVar(value=str(Path.home() / "SitiosDescargados"))
+        self.website_page_limit = tk.StringVar(value="50")
+        self.website_translate_dir = tk.StringVar()
+        self.website_progress_pct = tk.IntVar(value=0)
 
         # Registro de widgets "planos" (no-ttk) que hay que retematizar
         self._bg_frames = []       # frames con color de fondo tipo 'bg'
@@ -836,10 +1036,13 @@ class App(tk.Tk):
 
         tab_transcribe = tk.Frame(self.notebook, bg=self.colors["bg"])
         tab_translate = tk.Frame(self.notebook, bg=self.colors["bg"])
+        tab_website = tk.Frame(self.notebook, bg=self.colors["bg"])
         self._bg_frames.append(tab_transcribe)
         self._bg_frames.append(tab_translate)
+        self._bg_frames.append(tab_website)
         self.notebook.add(tab_transcribe, text="  Transcripción  ")
         self.notebook.add(tab_translate, text="  Traducción  ")
+        self.notebook.add(tab_website, text="  Sitio web  ")
 
         paned = ttk.PanedWindow(tab_transcribe, orient="horizontal")
         paned.pack(fill="both", expand=True, padx=0, pady=(12, 0))
@@ -850,6 +1053,7 @@ class App(tk.Tk):
         paned.add(right_panel, weight=2)
 
         self._build_translation_tab(tab_translate)
+        self._build_website_tab(tab_website)
 
     # ---------------------------------------------------------------
     def _build_transcript_panel(self, parent):
@@ -1297,6 +1501,250 @@ class App(tk.Tk):
             return
         Path(path).write_text(content, encoding="utf-8")
         messagebox.showinfo(APP_TITLE, "Archivo guardado correctamente.")
+
+    # ---------------------------------------------------------------
+    # Pestaña de Sitio web: descargar un sitio y, aparte, traducir uno
+    # ya descargado (con este mismo motor de traducción local).
+    # ---------------------------------------------------------------
+    def _build_website_tab(self, parent):
+        container = tk.Frame(parent, bg=self.colors["bg"])
+        container.pack(fill="both", expand=True, pady=(12, 0))
+
+        # ---- Tarjeta: Descargar sitio ----
+        dl_outer, dl_card = self._card(container)
+        dl_outer.pack(fill="x", pady=(0, 10))
+
+        self.website_dl_title = tk.Label(
+            dl_card, text="Descargar sitio web completo", bg=self.colors["panel"],
+            fg=self.colors["text"], font=(FONT_FAMILY, 10, "bold")
+        )
+        self.website_dl_title.pack(anchor="w", padx=16, pady=(14, 4))
+        self.website_dl_hint = tk.Label(
+            dl_card,
+            text="Descarga las páginas HTML del sitio (mismo dominio, siguiendo enlaces internos). No incluye imágenes/CSS/JS.",
+            bg=self.colors["panel"], fg=self.colors["text_muted"], font=(FONT_FAMILY, 8),
+            wraplength=700, justify="left"
+        )
+        self.website_dl_hint.pack(anchor="w", padx=16, pady=(0, 10))
+
+        url_row = self._panel_frame(dl_card)
+        url_row.pack(fill="x", padx=16, pady=4)
+        tk.Label(url_row, text="URL:", bg=self.colors["panel"], fg=self.colors["text"],
+                 font=(FONT_FAMILY, 10), width=14, anchor="w").pack(side="left")
+        url_entry = ttk.Entry(url_row, textvariable=self.website_url)
+        url_entry.pack(side="left", fill="x", expand=True)
+        self._add_entry_context_menu(url_entry)
+
+        dlout_row = self._panel_frame(dl_card)
+        dlout_row.pack(fill="x", padx=16, pady=4)
+        tk.Label(dlout_row, text="Carpeta destino:", bg=self.colors["panel"], fg=self.colors["text"],
+                 font=(FONT_FAMILY, 10), width=14, anchor="w").pack(side="left")
+        dlout_entry = ttk.Entry(dlout_row, textvariable=self.website_out_dir)
+        dlout_entry.pack(side="left", fill="x", expand=True)
+        self._add_entry_context_menu(dlout_entry)
+        b_dlout = RoundedButton(dlout_row, "Elegir", self.pick_website_out_dir,
+                                 self.colors, self.colors["panel"], width=90, height=28)
+        b_dlout.pack(side="left", padx=(8, 0))
+        self._round_buttons_accent.append(b_dlout)
+
+        limit_row = self._panel_frame(dl_card)
+        limit_row.pack(fill="x", padx=16, pady=4)
+        tk.Label(limit_row, text="Máx. de páginas:", bg=self.colors["panel"], fg=self.colors["text"],
+                 font=(FONT_FAMILY, 10), width=14, anchor="w").pack(side="left")
+        limit_entry = ttk.Entry(limit_row, textvariable=self.website_page_limit, width=10)
+        limit_entry.pack(side="left")
+        self._add_entry_context_menu(limit_entry)
+
+        dl_btn_row = self._panel_frame(dl_card)
+        dl_btn_row.pack(fill="x", padx=16, pady=(10, 6))
+        self.btn_website_download = RoundedButton(
+            dl_btn_row, "Descargar sitio", self.start_website_download,
+            self.colors, self.colors["panel"], width=180, height=36
+        )
+        self.btn_website_download.pack(side="left")
+        self._round_buttons_accent.append(self.btn_website_download)
+
+        self.website_dl_pct_label = tk.Label(
+            dl_btn_row, text="0%", bg=self.colors["panel"], fg=self.colors["accent"],
+            font=(FONT_FAMILY, 11, "bold")
+        )
+        self.website_dl_pct_label.pack(side="left", padx=12)
+
+        self.website_dl_progress = ttk.Progressbar(
+            dl_card, mode="determinate", maximum=100, variable=self.website_progress_pct,
+            style="Coral.Horizontal.TProgressbar"
+        )
+        self.website_dl_progress.pack(fill="x", padx=16, pady=(0, 8))
+
+        self.website_dl_status_var = tk.StringVar(value="Listo.")
+        self.website_dl_status_label = tk.Label(
+            dl_card, textvariable=self.website_dl_status_var, bg=self.colors["panel"],
+            fg=self.colors["text_muted"], font=(FONT_FAMILY, 9), wraplength=700,
+            justify="left", anchor="w"
+        )
+        self.website_dl_status_label.pack(anchor="w", padx=16, pady=(0, 16), fill="x")
+
+        # ---- Tarjeta: Traducir sitio ya descargado ----
+        tr_outer, tr_card = self._card(container)
+        tr_outer.pack(fill="x")
+
+        self.website_tr_title = tk.Label(
+            tr_card, text="Traducir sitio ya descargado", bg=self.colors["panel"],
+            fg=self.colors["text"], font=(FONT_FAMILY, 10, "bold")
+        )
+        self.website_tr_title.pack(anchor="w", padx=16, pady=(14, 4))
+        self.website_tr_hint = tk.Label(
+            tr_card,
+            text="Elegí la carpeta de un sitio ya descargado (con esta app u otra herramienta) y traducí su contenido.",
+            bg=self.colors["panel"], fg=self.colors["text_muted"], font=(FONT_FAMILY, 8),
+            wraplength=700, justify="left"
+        )
+        self.website_tr_hint.pack(anchor="w", padx=16, pady=(0, 10))
+
+        trdir_row = self._panel_frame(tr_card)
+        trdir_row.pack(fill="x", padx=16, pady=4)
+        tk.Label(trdir_row, text="Carpeta del sitio:", bg=self.colors["panel"], fg=self.colors["text"],
+                 font=(FONT_FAMILY, 10), width=14, anchor="w").pack(side="left")
+        trdir_entry = ttk.Entry(trdir_row, textvariable=self.website_translate_dir)
+        trdir_entry.pack(side="left", fill="x", expand=True)
+        self._add_entry_context_menu(trdir_entry)
+        b_trdir = RoundedButton(trdir_row, "Elegir", self.pick_website_translate_dir,
+                                 self.colors, self.colors["panel"], width=90, height=28)
+        b_trdir.pack(side="left", padx=(8, 0))
+        self._round_buttons_accent.append(b_trdir)
+
+        tr_btn_row = self._panel_frame(tr_card)
+        tr_btn_row.pack(fill="x", padx=16, pady=(10, 6))
+        self.btn_website_translate_en = RoundedButton(
+            tr_btn_row, "Traducir sitio a inglés", lambda: self.start_website_translation("en"),
+            self.colors, self.colors["panel"], width=190, height=36
+        )
+        self.btn_website_translate_en.pack(side="left")
+        self._round_buttons_accent.append(self.btn_website_translate_en)
+
+        self.btn_website_translate_es = RoundedButton(
+            tr_btn_row, "Traducir sitio a español", lambda: self.start_website_translation("es"),
+            self.colors, self.colors["panel"], width=190, height=36
+        )
+        self.btn_website_translate_es.pack(side="left", padx=(8, 0))
+        self._round_buttons_accent.append(self.btn_website_translate_es)
+
+        self.website_tr_pct_label = tk.Label(
+            tr_btn_row, text="0%", bg=self.colors["panel"], fg=self.colors["accent"],
+            font=(FONT_FAMILY, 11, "bold")
+        )
+        self.website_tr_pct_label.pack(side="left", padx=12)
+
+        self.website_tr_progress_var = tk.IntVar(value=0)
+        self.website_tr_progress = ttk.Progressbar(
+            tr_card, mode="determinate", maximum=100, variable=self.website_tr_progress_var,
+            style="Coral.Horizontal.TProgressbar"
+        )
+        self.website_tr_progress.pack(fill="x", padx=16, pady=(0, 8))
+
+        self.website_tr_status_var = tk.StringVar(value="Listo.")
+        self.website_tr_status_label = tk.Label(
+            tr_card, textvariable=self.website_tr_status_var, bg=self.colors["panel"],
+            fg=self.colors["text_muted"], font=(FONT_FAMILY, 9), wraplength=700,
+            justify="left", anchor="w"
+        )
+        self.website_tr_status_label.pack(anchor="w", padx=16, pady=(0, 16), fill="x")
+
+        return container
+
+    def pick_website_out_dir(self):
+        path = filedialog.askdirectory(title="Selecciona carpeta de destino")
+        if path:
+            self.website_out_dir.set(path)
+
+    def pick_website_translate_dir(self):
+        path = filedialog.askdirectory(title="Selecciona la carpeta del sitio a traducir")
+        if path:
+            self.website_translate_dir.set(path)
+
+    def start_website_download(self):
+        url = self.website_url.get().strip()
+        if not url:
+            messagebox.showwarning(APP_TITLE, "Escribí primero la URL del sitio.")
+            return
+        try:
+            page_limit = int(self.website_page_limit.get().strip())
+        except ValueError:
+            messagebox.showwarning(APP_TITLE, "El máximo de páginas debe ser un número.")
+            return
+
+        self.btn_website_download.set_enabled(False)
+        self.website_progress_pct.set(0)
+        self.website_dl_pct_label.configure(text="0%")
+        self.website_dl_status_var.set("Iniciando descarga...")
+
+        worker = WebsiteDownloaderWorker(
+            start_url=url, out_dir=self.website_out_dir.get(), page_limit=page_limit,
+            on_status=lambda msg: self.after(0, self._update_website_dl_status, msg),
+            on_progress_pct=lambda pct: self.after(0, self._update_website_dl_progress, pct),
+            on_done=lambda count, out_dir: self.after(0, self.on_website_download_done, count, out_dir),
+            on_error=lambda err: self.after(0, self.on_website_download_error, err),
+        )
+        worker.start()
+
+    def _update_website_dl_status(self, msg):
+        self.website_dl_status_var.set(msg)
+
+    def _update_website_dl_progress(self, pct):
+        self.website_progress_pct.set(pct)
+        self.website_dl_pct_label.configure(text=f"{pct}%")
+
+    def on_website_download_done(self, count, out_dir):
+        self.btn_website_download.set_enabled(True)
+        self.website_dl_status_var.set(f"¡Listo! Se descargaron {count} página(s) en: {out_dir}")
+        self.website_translate_dir.set(out_dir)
+        messagebox.showinfo(APP_TITLE, f"Se descargaron {count} página(s).\n\nGuardadas en:\n{out_dir}")
+
+    def on_website_download_error(self, error_message):
+        self.btn_website_download.set_enabled(True)
+        self.website_dl_status_var.set("Ocurrió un error durante la descarga.")
+        messagebox.showerror(APP_TITLE, f"Error al descargar el sitio:\n\n{error_message[:500]}")
+
+    def start_website_translation(self, target_lang):
+        site_dir = self.website_translate_dir.get().strip()
+        if not site_dir or not os.path.isdir(site_dir):
+            messagebox.showwarning(APP_TITLE, "Elegí una carpeta válida de un sitio ya descargado.")
+            return
+
+        self.btn_website_translate_en.set_enabled(False)
+        self.btn_website_translate_es.set_enabled(False)
+        self.website_tr_progress_var.set(0)
+        self.website_tr_pct_label.configure(text="0%")
+        self.website_tr_status_var.set("Iniciando traducción del sitio...")
+
+        worker = WebsiteTranslateWorker(
+            site_dir=site_dir, target_lang=target_lang,
+            out_dir=self.website_out_dir.get() or str(Path.home() / "SitiosDescargados"),
+            on_status=lambda msg: self.after(0, self._update_website_tr_status, msg),
+            on_progress_pct=lambda pct: self.after(0, self._update_website_tr_progress, pct),
+            on_done=lambda count, out_dir: self.after(0, self.on_website_translation_done, count, out_dir),
+            on_error=lambda err: self.after(0, self.on_website_translation_error, err),
+        )
+        worker.start()
+
+    def _update_website_tr_status(self, msg):
+        self.website_tr_status_var.set(msg)
+
+    def _update_website_tr_progress(self, pct):
+        self.website_tr_progress_var.set(pct)
+        self.website_tr_pct_label.configure(text=f"{pct}%")
+
+    def on_website_translation_done(self, count, out_dir):
+        self.btn_website_translate_en.set_enabled(True)
+        self.btn_website_translate_es.set_enabled(True)
+        self.website_tr_status_var.set(f"¡Listo! Se tradujeron {count} página(s) en: {out_dir}")
+        messagebox.showinfo(APP_TITLE, f"Se tradujeron {count} página(s).\n\nGuardadas en:\n{out_dir}")
+
+    def on_website_translation_error(self, error_message):
+        self.btn_website_translate_en.set_enabled(True)
+        self.btn_website_translate_es.set_enabled(True)
+        self.website_tr_status_var.set("Ocurrió un error durante la traducción.")
+        messagebox.showerror(APP_TITLE, f"Error al traducir el sitio:\n\n{error_message[:500]}")
 
     # ---------------------------------------------------------------
     # Tema claro/oscuro
