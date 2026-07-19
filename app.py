@@ -215,8 +215,7 @@ class TranscriberWorker(threading.Thread):
 
     def __init__(self, filepath, model_size, language, use_gpu, out_dir,
                  on_status, on_segment, on_progress_pct, on_done, on_error,
-                 on_clear=None, on_time_update=None, audio_track=None, translate=False,
-                 translate_to_spanish=False):
+                 on_clear=None, on_time_update=None, audio_track=None):
         super().__init__(daemon=True)
         self.filepath = filepath
         self.model_size = model_size
@@ -231,8 +230,6 @@ class TranscriberWorker(threading.Thread):
         self.on_clear = on_clear or (lambda: None)
         self.on_time_update = on_time_update or (lambda elapsed, eta: None)
         self.audio_track = audio_track
-        self.translate = translate
-        self.translate_to_spanish = translate_to_spanish
 
     CHUNK_SECONDS = 300  # procesar en bloques de 5 minutos
 
@@ -294,35 +291,6 @@ class TranscriberWorker(threading.Thread):
             total_samples = len(audio_array)
             num_chunks = max(1, math.ceil(total_samples / chunk_samples))
 
-            translator_state = {"model": None, "tok": None}
-
-            def translate_texts_to_spanish(texts, dev):
-                texts = [t for t in texts if t]
-                if not texts:
-                    return []
-                if translator_state["model"] is None:
-                    self.on_status(
-                        "Cargando modelo de traducción inglés→español "
-                        "(la primera vez descarga ~300MB)..."
-                    )
-                    from transformers import MarianMTModel, MarianTokenizer
-                    name = "Helsinki-NLP/opus-mt-en-es"
-                    translator_state["tok"] = MarianTokenizer.from_pretrained(
-                        name, cache_dir=models_dir
-                    )
-                    tmodel = MarianMTModel.from_pretrained(name, cache_dir=models_dir)
-                    if dev == "cuda":
-                        tmodel = tmodel.to("cuda")
-                    translator_state["model"] = tmodel
-                tok = translator_state["tok"]
-                tmodel = translator_state["model"]
-                inputs = tok(texts, return_tensors="pt", padding=True, truncation=True)
-                if dev == "cuda":
-                    inputs = {k: v.to("cuda") for k, v in inputs.items()}
-                with torch.no_grad():
-                    generated = tmodel.generate(**inputs, max_length=512)
-                return [tok.decode(t, skip_special_tokens=True).strip() for t in generated]
-
             def run_pass(dev):
                 self.on_status(f"Cargando modelo '{self.model_size}' en {dev.upper()}...")
                 m = whisper.load_model(self.model_size, device=dev, download_root=models_dir)
@@ -331,7 +299,7 @@ class TranscriberWorker(threading.Thread):
                     f"{self.CHUNK_SECONDS // 60} min..."
                 )
 
-                out_txt, out_srt, out_plain = [], [], []
+                out_txt, out_srt, out_plain, out_segments = [], [], [], []
                 detected_lang = self.language
                 prev_text_tail = None
                 start_time = time.time()
@@ -350,28 +318,12 @@ class TranscriberWorker(threading.Thread):
                         fp16=(dev == "cuda"),
                         verbose=False,
                         initial_prompt=prev_text_tail,
-                        task="translate" if self.translate else "transcribe",
                     )
 
                     if detected_lang is None:
                         detected_lang = result.get("language")
 
                     chunk_segments = result.get("segments", [])
-
-                    if self.translate_to_spanish and chunk_segments:
-                        self.on_status(
-                            f"Traduciendo bloque {idx + 1} de {num_chunks} al español..."
-                        )
-                        texts_en = [seg["text"].strip() for seg in chunk_segments]
-                        try:
-                            texts_es = translate_texts_to_spanish(texts_en, dev)
-                            ei = 0
-                            for seg in chunk_segments:
-                                if seg["text"].strip():
-                                    seg["text"] = texts_es[ei]
-                                    ei += 1
-                        except Exception as tr_err:
-                            self.on_status(f"No se pudo traducir este bloque: {tr_err}")
                     for seg in chunk_segments:
                         start_sec = seg["start"] + chunk_offset
                         end_sec = seg["end"] + chunk_offset
@@ -382,6 +334,7 @@ class TranscriberWorker(threading.Thread):
                         end_fmt = format_timestamp_txt(end_sec)
                         out_txt.append(f"[{start_fmt} --> {end_fmt}] {text}")
                         out_plain.append(text)
+                        out_segments.append({"start": start_sec, "end": end_sec, "text": text})
                         out_srt.append(
                             f"{len(out_plain)}\n{format_timestamp_srt(start_sec)} --> "
                             f"{format_timestamp_srt(end_sec)}\n{text}\n"
@@ -402,10 +355,10 @@ class TranscriberWorker(threading.Thread):
                     self.on_progress_pct(pct)
                     self.on_time_update(self._fmt_duration(elapsed), self._fmt_duration(eta))
 
-                return detected_lang, out_txt, out_srt, out_plain
+                return detected_lang, out_txt, out_srt, out_plain, out_segments
 
             try:
-                detected_lang, lines_txt, lines_srt, plain_text = run_pass(device)
+                detected_lang, lines_txt, lines_srt, plain_text, segments = run_pass(device)
             except Exception as gpu_err:
                 error_text = str(gpu_err).lower()
                 gpu_related = any(
@@ -421,7 +374,7 @@ class TranscriberWorker(threading.Thread):
                     device = "cpu"
                     self.on_clear()
                     self.on_progress_pct(0)
-                    detected_lang, lines_txt, lines_srt, plain_text = run_pass(device)
+                    detected_lang, lines_txt, lines_srt, plain_text, segments = run_pass(device)
                 else:
                     raise
 
@@ -447,7 +400,209 @@ class TranscriberWorker(threading.Thread):
             md_path.write_text(md_content, encoding="utf-8")
 
             self.on_progress_pct(100)
-            self.on_done(str(txt_path), str(srt_path), str(md_path), str(plain_txt_path))
+            # Se pasa también el audio cargado, la config usada y los segmentos,
+            # para que un paso de traducción posterior (opcional) no tenga que
+            # volver a leer/decodificar el archivo desde cero.
+            self.on_done(
+                str(txt_path), str(srt_path), str(md_path), str(plain_txt_path),
+                {
+                    "audio_array": audio_array, "sr": sr, "device": device,
+                    "model_size": self.model_size, "base_name": base_name,
+                    "segments": segments,
+                },
+            )
+        except Exception as e:
+            self.on_error(f"{e}\n\n{traceback.format_exc()}")
+
+
+class TranslateToEnglishWorker(threading.Thread):
+    """Segundo paso opcional: reusa el audio ya cargado en memoria para
+    traducir (tarea nativa de Whisper) hacia inglés, sin re-leer el archivo."""
+
+    CHUNK_SECONDS = TranscriberWorker.CHUNK_SECONDS
+
+    def __init__(self, audio_array, sr, device, model_size, out_dir, base_name,
+                 on_status, on_segment, on_progress_pct, on_done, on_error, on_clear):
+        super().__init__(daemon=True)
+        self.audio_array = audio_array
+        self.sr = sr
+        self.device = device
+        self.model_size = model_size
+        self.out_dir = out_dir
+        self.base_name = base_name
+        self.on_status = on_status
+        self.on_segment = on_segment
+        self.on_progress_pct = on_progress_pct
+        self.on_done = on_done
+        self.on_error = on_error
+        self.on_clear = on_clear
+
+    def run(self):
+        try:
+            import time
+            import numpy as np
+            import whisper
+
+            self.on_clear()
+            self.on_progress_pct(0)
+
+            if getattr(sys, "frozen", False):
+                base_dir = Path(sys.executable).parent
+            else:
+                base_dir = Path(__file__).resolve().parent
+            models_dir = str(base_dir / "models")
+
+            self.on_status(f"Cargando modelo '{self.model_size}' en {self.device.upper()}...")
+            m = whisper.load_model(self.model_size, device=self.device, download_root=models_dir)
+
+            chunk_samples = int(self.CHUNK_SECONDS * self.sr)
+            total_samples = len(self.audio_array)
+            num_chunks = max(1, math.ceil(total_samples / chunk_samples))
+            self.on_status(f"Traduciendo al inglés en {num_chunks} bloque(s)...")
+
+            out_txt, out_srt, out_plain = [], [], []
+            start_time = time.time()
+
+            for idx in range(num_chunks):
+                chunk_start_sample = idx * chunk_samples
+                chunk_end_sample = min(total_samples, chunk_start_sample + chunk_samples)
+                chunk = self.audio_array[chunk_start_sample:chunk_end_sample]
+                chunk_offset = chunk_start_sample / self.sr
+
+                self.on_status(f"Traduciendo bloque {idx + 1} de {num_chunks}...")
+                result = m.transcribe(
+                    chunk.astype(np.float32),
+                    fp16=(self.device == "cuda"),
+                    verbose=False,
+                    task="translate",
+                )
+                for seg in result.get("segments", []):
+                    start_sec = seg["start"] + chunk_offset
+                    end_sec = seg["end"] + chunk_offset
+                    text = seg["text"].strip()
+                    if not text:
+                        continue
+                    start_fmt = format_timestamp_txt(start_sec)
+                    end_fmt = format_timestamp_txt(end_sec)
+                    out_txt.append(f"[{start_fmt} --> {end_fmt}] {text}")
+                    out_plain.append(text)
+                    out_srt.append(
+                        f"{len(out_plain)}\n{format_timestamp_srt(start_sec)} --> "
+                        f"{format_timestamp_srt(end_sec)}\n{text}\n"
+                    )
+                    self.on_segment(text, start_fmt, end_fmt)
+
+                chunks_done = idx + 1
+                elapsed = time.time() - start_time
+                eta = (elapsed / chunks_done) * (num_chunks - chunks_done)
+                pct = min(100, int(chunk_end_sample / total_samples * 100))
+                self.on_progress_pct(pct)
+                self.on_status(
+                    f"Transcurrido: {TranscriberWorker._fmt_duration(elapsed)} · "
+                    f"Restante: ~{TranscriberWorker._fmt_duration(eta)}"
+                )
+
+            out_dir = Path(self.out_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            txt_path = out_dir / f"{self.base_name}_ingles.txt"
+            srt_path = out_dir / f"{self.base_name}_ingles.srt"
+            plain_path = out_dir / f"{self.base_name}_ingles_texto_plano.txt"
+            txt_path.write_text("\n".join(out_txt), encoding="utf-8")
+            srt_path.write_text("\n".join(out_srt), encoding="utf-8")
+            plain_path.write_text("\n".join(out_plain), encoding="utf-8")
+
+            self.on_progress_pct(100)
+            self.on_done(str(txt_path), str(srt_path), str(plain_path))
+        except Exception as e:
+            self.on_error(f"{e}\n\n{traceback.format_exc()}")
+
+
+class TranslateToSpanishWorker(threading.Thread):
+    """Segundo paso opcional: traduce el texto (en inglés) que esté
+    actualmente mostrado en el panel hacia español, usando un modelo local
+    de traducción de texto (no vuelve a tocar el audio)."""
+
+    def __init__(self, segments, out_dir, base_name,
+                 on_status, on_segment, on_progress_pct, on_done, on_error, on_clear):
+        super().__init__(daemon=True)
+        self.segments = segments  # lista de dicts {start, end, text}
+        self.out_dir = out_dir
+        self.base_name = base_name
+        self.on_status = on_status
+        self.on_segment = on_segment
+        self.on_progress_pct = on_progress_pct
+        self.on_done = on_done
+        self.on_error = on_error
+        self.on_clear = on_clear
+
+    def run(self):
+        try:
+            import torch
+
+            self.on_clear()
+            self.on_progress_pct(0)
+
+            if not self.segments:
+                raise RuntimeError("No hay texto para traducir todavía.")
+
+            if getattr(sys, "frozen", False):
+                base_dir = Path(sys.executable).parent
+            else:
+                base_dir = Path(__file__).resolve().parent
+            models_dir = str(base_dir / "models")
+
+            self.on_status(
+                "Cargando modelo de traducción inglés→español "
+                "(la primera vez descarga ~300MB)..."
+            )
+            from transformers import MarianMTModel, MarianTokenizer
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            name = "Helsinki-NLP/opus-mt-en-es"
+            tok = MarianTokenizer.from_pretrained(name, cache_dir=models_dir)
+            tmodel = MarianMTModel.from_pretrained(name, cache_dir=models_dir)
+            if device == "cuda":
+                tmodel = tmodel.to("cuda")
+
+            out_txt, out_srt, out_plain = [], [], []
+            batch_size = 16
+            total = len(self.segments)
+
+            for start_i in range(0, total, batch_size):
+                batch = self.segments[start_i:start_i + batch_size]
+                texts = [s["text"] for s in batch]
+                self.on_status(f"Traduciendo {start_i + len(batch)} de {total} líneas...")
+
+                inputs = tok(texts, return_tensors="pt", padding=True, truncation=True)
+                if device == "cuda":
+                    inputs = {k: v.to("cuda") for k, v in inputs.items()}
+                with torch.no_grad():
+                    generated = tmodel.generate(**inputs, max_length=512)
+                translated = [tok.decode(t, skip_special_tokens=True).strip() for t in generated]
+
+                for seg, es_text in zip(batch, translated):
+                    start_fmt = format_timestamp_txt(seg["start"])
+                    end_fmt = format_timestamp_txt(seg["end"])
+                    out_txt.append(f"[{start_fmt} --> {end_fmt}] {es_text}")
+                    out_plain.append(es_text)
+                    out_srt.append(
+                        f"{len(out_plain)}\n{format_timestamp_srt(seg['start'])} --> "
+                        f"{format_timestamp_srt(seg['end'])}\n{es_text}\n"
+                    )
+                    self.on_segment(es_text, start_fmt, end_fmt)
+
+                self.on_progress_pct(min(100, int((start_i + len(batch)) / total * 100)))
+
+            out_dir = Path(self.out_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            txt_path = out_dir / f"{self.base_name}_espanol.txt"
+            srt_path = out_dir / f"{self.base_name}_espanol.srt"
+            plain_path = out_dir / f"{self.base_name}_espanol_texto_plano.txt"
+            txt_path.write_text("\n".join(out_txt), encoding="utf-8")
+            srt_path.write_text("\n".join(out_srt), encoding="utf-8")
+            plain_path.write_text("\n".join(out_plain), encoding="utf-8")
+
+            self.on_progress_pct(100)
+            self.on_done(str(txt_path), str(srt_path), str(plain_path))
         except Exception as e:
             self.on_error(f"{e}\n\n{traceback.format_exc()}")
 
@@ -533,12 +688,14 @@ class App(tk.Tk):
         self.model_size = tk.StringVar(value="large-v3")
         self.language_label = tk.StringVar(value="Detectar automáticamente")
         self.use_gpu = tk.BooleanVar(value=True)
-        self.translate_to_english = tk.BooleanVar(value=False)
-        self.translate_to_spanish = tk.BooleanVar(value=False)
+        # (la traducción ahora es un paso separado, ver sección "Traducción")
         self.selected_audio_track = None
         self.audio_tracks_info = []
         self.progress_pct = tk.IntVar(value=0)
         self._last_paths = None
+        self._translation_cache = None
+        self.doc_progress_pct = tk.IntVar(value=0)
+        self.doc_filepath = tk.StringVar()
 
         # Registro de widgets "planos" (no-ttk) que hay que retematizar
         self._bg_frames = []       # frames con color de fondo tipo 'bg'
@@ -596,13 +753,25 @@ class App(tk.Tk):
         self.theme_btn.pack(side="right")
         self._round_buttons_plain.append(self.theme_btn)
 
-        paned = ttk.PanedWindow(self, orient="horizontal")
-        paned.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self.notebook = ttk.Notebook(self, style="App.TNotebook")
+        self.notebook.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+
+        tab_transcribe = tk.Frame(self.notebook, bg=self.colors["bg"])
+        tab_translate = tk.Frame(self.notebook, bg=self.colors["bg"])
+        self._bg_frames.append(tab_transcribe)
+        self._bg_frames.append(tab_translate)
+        self.notebook.add(tab_transcribe, text="  Transcripción  ")
+        self.notebook.add(tab_translate, text="  Traducción  ")
+
+        paned = ttk.PanedWindow(tab_transcribe, orient="horizontal")
+        paned.pack(fill="both", expand=True, padx=0, pady=(12, 0))
 
         left_panel = self._build_transcript_panel(paned)
         right_panel = self._build_controls_panel(paned)
         paned.add(left_panel, weight=3)
         paned.add(right_panel, weight=2)
+
+        self._build_translation_tab(tab_translate)
 
     # ---------------------------------------------------------------
     def _build_transcript_panel(self, parent):
@@ -675,7 +844,11 @@ class App(tk.Tk):
 
     # ---------------------------------------------------------------
     def _build_controls_panel(self, parent):
-        outer, card = self._card(parent)
+        container = tk.Frame(parent, bg=self.colors["bg"])
+        self._bg_frames.append(container)
+
+        outer, card = self._card(container)
+        outer.pack(fill="both", expand=True, pady=(0, 10))
         pad = {"padx": 16, "pady": 6}
 
         self.config_title = tk.Label(card, text="Configuración", bg=self.colors["panel"],
@@ -747,34 +920,6 @@ class App(tk.Tk):
         ttk.Checkbutton(gpu_row, text="Usar GPU (NVIDIA/CUDA) si está disponible",
                          variable=self.use_gpu).pack(anchor="w")
 
-        translate_row = self._panel_frame(card)
-        translate_row.pack(fill="x", padx=16, pady=(4, 4))
-        ttk.Checkbutton(
-            translate_row, text="Traducir al inglés (subtítulos)",
-            variable=self.translate_to_english
-        ).pack(anchor="w")
-        translate_hint = tk.Label(
-            translate_row, text="Traduce el audio original al inglés (solo hacia inglés).",
-            bg=self.colors["panel"], fg=self.colors["text_muted"], font=(FONT_FAMILY, 8)
-        )
-        translate_hint.pack(anchor="w")
-
-        translate_es_row = self._panel_frame(card)
-        translate_es_row.pack(fill="x", padx=16, pady=(4, 4))
-        ttk.Checkbutton(
-            translate_es_row, text="Traducir texto en inglés al español",
-            variable=self.translate_to_spanish
-        ).pack(anchor="w")
-        translate_es_hint = tk.Label(
-            translate_es_row,
-            text=("Requiere que el resultado esté en inglés (audio en inglés, o marca "
-                  "también \"Traducir al inglés\" si el audio es de otro idioma). "
-                  "Descarga un modelo adicional (~300MB) la primera vez."),
-            bg=self.colors["panel"], fg=self.colors["text_muted"], font=(FONT_FAMILY, 8),
-            wraplength=320, justify="left"
-        )
-        translate_es_hint.pack(anchor="w")
-
         run_row = self._panel_frame(card)
         run_row.pack(fill="x", padx=16, pady=(18, 10))
         self.btn_run = RoundedButton(run_row, "Transcribir", self.start_transcription,
@@ -805,7 +950,275 @@ class App(tk.Tk):
         log_scroll.config(command=self.log_text.yview)
         self._log_widgets.append(self.log_text)
 
-        return outer
+        # ---- Tarjeta aparte: Traducción (paso opcional, después de transcribir) ----
+        trans_outer, trans_card = self._card(container)
+        trans_outer.pack(fill="x")
+
+        self.translate_title = tk.Label(
+            trans_card, text="Traducción (paso aparte)", bg=self.colors["panel"],
+            fg=self.colors["text"], font=(FONT_FAMILY, 10, "bold")
+        )
+        self.translate_title.pack(anchor="w", padx=16, pady=(14, 4))
+
+        self.translate_hint_label = tk.Label(
+            trans_card,
+            text=("Se activa cuando termina una transcripción. Genera archivos nuevos "
+                  "aparte, sin tocar los originales."),
+            bg=self.colors["panel"], fg=self.colors["text_muted"], font=(FONT_FAMILY, 8),
+            wraplength=320, justify="left"
+        )
+        self.translate_hint_label.pack(anchor="w", padx=16, pady=(0, 10))
+
+        trans_btn_row = self._panel_frame(trans_card)
+        trans_btn_row.pack(fill="x", padx=16, pady=(0, 16))
+
+        self.btn_translate_en = RoundedButton(
+            trans_btn_row, "Traducir a inglés", self.start_translate_to_english,
+            self.colors, self.colors["panel"], width=150, height=34, use_accent=False
+        )
+        self.btn_translate_en.pack(side="left")
+        self.btn_translate_en.set_enabled(False)
+        self._round_buttons_plain_panel.append(self.btn_translate_en)
+
+        self.btn_translate_es = RoundedButton(
+            trans_btn_row, "Traducir a español", self.start_translate_to_spanish,
+            self.colors, self.colors["panel"], width=150, height=34, use_accent=False
+        )
+        self.btn_translate_es.pack(side="left", padx=(8, 0))
+        self.btn_translate_es.set_enabled(False)
+        self._round_buttons_plain_panel.append(self.btn_translate_es)
+
+        return container
+
+    # ---------------------------------------------------------------
+    # Pestaña de Traducción: independiente, para cualquier documento
+    # de texto, sin pasar por la transcripción.
+    # ---------------------------------------------------------------
+    def _build_translation_tab(self, parent):
+        paned = ttk.PanedWindow(parent, orient="horizontal")
+        paned.pack(fill="both", expand=True, pady=(12, 0))
+
+        # ---- Panel izquierdo: contenido del documento ----
+        left_outer, left_card = self._card(paned)
+
+        top = self._panel_frame(left_card)
+        top.pack(fill="x", padx=16, pady=(14, 6))
+        self.doc_title_label = tk.Label(
+            top, text="Documento", bg=self.colors["panel"], fg=self.colors["text"],
+            font=(FONT_FAMILY, 10, "bold")
+        )
+        self.doc_title_label.pack(side="left")
+        self.doc_pct_label = tk.Label(
+            top, text="0%", bg=self.colors["panel"], fg=self.colors["accent"],
+            font=(FONT_FAMILY, 12, "bold")
+        )
+        self.doc_pct_label.pack(side="right")
+
+        self.doc_progress = ttk.Progressbar(
+            left_card, mode="determinate", maximum=100, variable=self.doc_progress_pct,
+            style="Coral.Horizontal.TProgressbar"
+        )
+        self.doc_progress.pack(fill="x", padx=16, pady=(0, 10))
+
+        self.doc_hint_label = tk.Label(
+            left_card,
+            text="Cargá un archivo o pegá/escribí texto directamente acá. Editable con Ctrl+Z y clic derecho.",
+            bg=self.colors["panel"], fg=self.colors["text_muted"], font=(FONT_FAMILY, 9)
+        )
+        self.doc_hint_label.pack(anchor="w", padx=16, pady=(0, 6))
+
+        doc_text_frame = self._panel_frame(left_card)
+        doc_text_frame.pack(fill="both", expand=True, padx=16, pady=(0, 10))
+
+        doc_scrollbar = ttk.Scrollbar(doc_text_frame)
+        doc_scrollbar.pack(side="right", fill="y")
+
+        self.doc_text = tk.Text(
+            doc_text_frame, wrap="word", bg=self.colors["surface"], fg=self.colors["text"],
+            font=(FONT_FAMILY, 11), relief="flat", padx=12, pady=12,
+            insertbackground=self.colors["text"], yscrollcommand=doc_scrollbar.set,
+            undo=True, autoseparators=True, maxundo=-1,
+        )
+        self.doc_text.pack(fill="both", expand=True)
+        doc_scrollbar.config(command=self.doc_text.yview)
+        self._surface_widgets.append(self.doc_text)
+        self._bind_text_edit_shortcuts(self.doc_text)
+        self._add_text_context_menu(self.doc_text)
+
+        doc_btn_row = self._panel_frame(left_card)
+        doc_btn_row.pack(fill="x", padx=16, pady=(0, 14))
+        self.btn_save_translation = RoundedButton(
+            doc_btn_row, "Guardar como...", self.save_translation_as,
+            self.colors, self.colors["panel"], width=160, height=34
+        )
+        self.btn_save_translation.pack(side="left")
+        self._round_buttons_accent.append(self.btn_save_translation)
+
+        paned.add(left_outer, weight=3)
+
+        # ---- Panel derecho: controles de traducción ----
+        right_outer, right_card = self._card(paned)
+
+        self.doc_config_title = tk.Label(
+            right_card, text="Traducir documento", bg=self.colors["panel"],
+            fg=self.colors["text"], font=(FONT_FAMILY, 10, "bold")
+        )
+        self.doc_config_title.pack(anchor="w", padx=16, pady=(14, 10))
+
+        self._doc_field_labels = []
+
+        def doc_field_label(text):
+            lbl = tk.Label(right_card, text=text, bg=self.colors["panel"],
+                            fg=self.colors["text"], font=(FONT_FAMILY, 10))
+            lbl.pack(anchor="w", padx=16, pady=6)
+            self._doc_field_labels.append(lbl)
+            return lbl
+
+        doc_field_label("Archivo (.txt, .md, .srt) — opcional")
+        doc_file_row = self._panel_frame(right_card)
+        doc_file_row.pack(fill="x", padx=16)
+        doc_file_entry = ttk.Entry(doc_file_row, textvariable=self.doc_filepath)
+        doc_file_entry.pack(side="left", fill="x", expand=True, ipady=3)
+        self._add_entry_context_menu(doc_file_entry)
+        b_load = RoundedButton(doc_file_row, "Cargar", self.load_document_for_translation,
+                                self.colors, self.colors["panel"], width=100, height=30)
+        b_load.pack(side="left", padx=(8, 0))
+        self._round_buttons_accent.append(b_load)
+
+        self.doc_load_hint = tk.Label(
+            right_card,
+            text="No hace falta cargar un archivo: también podés pegar o escribir texto directo en el panel de la izquierda.",
+            bg=self.colors["panel"], fg=self.colors["text_muted"], font=(FONT_FAMILY, 8),
+            wraplength=290, justify="left"
+        )
+        self.doc_load_hint.pack(anchor="w", padx=16, pady=(4, 16))
+
+        doc_btn_col = self._panel_frame(right_card)
+        doc_btn_col.pack(fill="x", padx=16, pady=(0, 10))
+
+        self.btn_doc_translate_en = RoundedButton(
+            doc_btn_col, "Traducir a inglés", lambda: self.start_document_translation("en"),
+            self.colors, self.colors["panel"], width=220, height=38
+        )
+        self.btn_doc_translate_en.pack(anchor="w", pady=(0, 8))
+        self._round_buttons_accent.append(self.btn_doc_translate_en)
+
+        self.btn_doc_translate_es = RoundedButton(
+            doc_btn_col, "Traducir a español", lambda: self.start_document_translation("es"),
+            self.colors, self.colors["panel"], width=220, height=38
+        )
+        self.btn_doc_translate_es.pack(anchor="w")
+        self._round_buttons_accent.append(self.btn_doc_translate_es)
+
+        self.doc_dir_hint = tk.Label(
+            right_card,
+            text=("\"A inglés\" asume que el texto está en español. \"A español\" asume que "
+                  "está en inglés. Descarga un modelo local (~300MB) la primera vez que uses "
+                  "cada dirección."),
+            bg=self.colors["panel"], fg=self.colors["text_muted"], font=(FONT_FAMILY, 8),
+            wraplength=290, justify="left"
+        )
+        self.doc_dir_hint.pack(anchor="w", padx=16, pady=(10, 16))
+
+        self.doc_status_var = tk.StringVar(value="Listo.")
+        self.doc_status_label = tk.Label(
+            right_card, textvariable=self.doc_status_var, bg=self.colors["panel"],
+            fg=self.colors["text_muted"], font=(FONT_FAMILY, 9), wraplength=290, justify="left"
+        )
+        self.doc_status_label.pack(anchor="w", padx=16, pady=(4, 16))
+
+        paned.add(right_outer, weight=2)
+        return paned
+
+    def load_document_for_translation(self):
+        path = filedialog.askopenfilename(
+            title="Selecciona un documento de texto",
+            filetypes=[
+                ("Texto/Markdown/Subtítulos", "*.txt *.md *.srt"),
+                ("Todos los archivos", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        try:
+            raw = Path(path).read_text(encoding="utf-8", errors="ignore")
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, f"No se pudo leer el archivo:\n\n{e}")
+            return
+
+        if path.lower().endswith(".srt"):
+            lines = []
+            for line in raw.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.isdigit() or "-->" in stripped:
+                    continue
+                lines.append(stripped)
+            content = "\n".join(lines)
+        else:
+            content = raw
+
+        self.doc_filepath.set(path)
+        self.doc_text.delete("1.0", "end")
+        self.doc_text.insert("1.0", content)
+        self.doc_status_var.set(f"Documento cargado: {Path(path).name}")
+
+    def start_document_translation(self, target_lang):
+        text = self.doc_text.get("1.0", "end").strip()
+        if not text:
+            messagebox.showwarning(APP_TITLE, "Cargá un documento o escribí/pegá texto primero.")
+            return
+
+        base_name = Path(self.doc_filepath.get()).stem if self.doc_filepath.get() else "documento"
+        out_dir = self.out_dir.get() or str(Path.home() / "Transcripciones")
+
+        self.btn_doc_translate_en.set_enabled(False)
+        self.btn_doc_translate_es.set_enabled(False)
+        self.doc_progress_pct.set(0)
+        self.doc_pct_label.configure(text="0%")
+        self.doc_status_var.set("Iniciando traducción...")
+
+        worker = TextDocumentTranslateWorker(
+            text=text, target_lang=target_lang, out_dir=out_dir, base_name=base_name,
+            on_status=lambda msg: self.after(0, self.doc_status_var.set, msg),
+            on_progress_pct=lambda pct: self.after(0, self._update_doc_progress, pct),
+            on_done=lambda translated_text, out_path: self.after(
+                0, self.on_document_translation_done, translated_text, out_path
+            ),
+            on_error=lambda err: self.after(0, self.on_document_translation_error, err),
+        )
+        worker.start()
+
+    def _update_doc_progress(self, pct):
+        self.doc_progress_pct.set(pct)
+        self.doc_pct_label.configure(text=f"{pct}%")
+
+    def on_document_translation_done(self, translated_text, out_path):
+        self.btn_doc_translate_en.set_enabled(True)
+        self.btn_doc_translate_es.set_enabled(True)
+        self.doc_text.delete("1.0", "end")
+        self.doc_text.insert("1.0", translated_text)
+        self.doc_status_var.set(f"¡Traducción completada! Guardada en:\n{out_path}")
+        messagebox.showinfo(APP_TITLE, f"Traducción completada.\n\nGuardada en:\n{out_path}")
+
+    def on_document_translation_error(self, error_message):
+        self.btn_doc_translate_en.set_enabled(True)
+        self.btn_doc_translate_es.set_enabled(True)
+        self.doc_status_var.set("Ocurrió un error durante la traducción.")
+        messagebox.showerror(APP_TITLE, f"Error durante la traducción:\n\n{error_message[:500]}")
+
+    def save_translation_as(self):
+        content = self.doc_text.get("1.0", "end").strip()
+        if not content:
+            messagebox.showwarning(APP_TITLE, "No hay texto para guardar.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Guardar como...", defaultextension=".txt",
+            filetypes=[("Texto", "*.txt"), ("Todos los archivos", "*.*")],
+        )
+        if not path:
+            return
+        Path(path).write_text(content, encoding="utf-8")
+        messagebox.showinfo(APP_TITLE, "Archivo guardado correctamente.")
 
     # ---------------------------------------------------------------
     # Tema claro/oscuro
@@ -852,6 +1265,15 @@ class App(tk.Tk):
         self.style.configure("Coral.Horizontal.TProgressbar", troughcolor=c["track"],
                               background=c["accent"], bordercolor=c["track"],
                               lightcolor=c["accent"], darkcolor=c["accent"])
+
+        self.style.configure("App.TNotebook", background=c["bg"], borderwidth=0)
+        self.style.configure("App.TNotebook.Tab", background=c["bg"], foreground=c["text_muted"],
+                              padding=(14, 8), font=(FONT_FAMILY, 10, "bold"), borderwidth=0)
+        self.style.map(
+            "App.TNotebook.Tab",
+            background=[("selected", c["panel"])],
+            foreground=[("selected", c["accent"])],
+        )
 
         self.style.configure("TEntry", fieldbackground=c["surface"], foreground=c["text"],
                               bordercolor=c["border"], lightcolor=c["border"], darkcolor=c["border"])
@@ -1032,11 +1454,14 @@ class App(tk.Tk):
             return
 
         self.btn_run.set_enabled(False)
+        self.btn_translate_en.set_enabled(False)
+        self.btn_translate_es.set_enabled(False)
         self.transcript_text.delete("1.0", "end")
         self.update_progress(0)
         self.time_label.configure(text="")
         self.set_status("Iniciando...")
         self._last_paths = None
+        self._translation_cache = None
 
         language = LANGUAGE_MAP.get(self.language_label.get())
 
@@ -1049,24 +1474,25 @@ class App(tk.Tk):
             on_status=lambda msg: self.after(0, self.set_status, msg),
             on_segment=lambda text, start, end: self.after(0, self.append_segment, text, start, end),
             on_progress_pct=lambda pct: self.after(0, self.update_progress, pct),
-            on_done=lambda txt, srt, md, plain: self.after(0, self.on_done, txt, srt, md, plain),
+            on_done=lambda txt, srt, md, plain, cache: self.after(0, self.on_done, txt, srt, md, plain, cache),
             on_error=lambda err: self.after(0, self.on_error, err),
             on_clear=lambda: self.after(0, lambda: self.transcript_text.delete("1.0", "end")),
             on_time_update=lambda elapsed, eta: self.after(0, self.update_time_info, elapsed, eta),
             audio_track=self.selected_audio_track,
-            translate=self.translate_to_english.get(),
-            translate_to_spanish=self.translate_to_spanish.get(),
         )
         worker.start()
 
-    def on_done(self, txt_path, srt_path, md_path, plain_txt_path):
+    def on_done(self, txt_path, srt_path, md_path, plain_txt_path, cache):
         self.btn_run.set_enabled(True)
         self.set_status("¡Transcripción completada!")
         self._last_paths = (txt_path, srt_path, md_path, plain_txt_path)
+        self._translation_cache = cache  # audio_array, sr, device, model_size, base_name, segments
         self.log(f"TXT (con tiempos): {txt_path}")
         self.log(f"SRT: {srt_path}")
         self.log(f"MD:  {md_path}")
         self.log(f"TXT (texto plano): {plain_txt_path}")
+        self.btn_translate_en.set_enabled(True)
+        self.btn_translate_es.set_enabled(True)
         messagebox.showinfo(APP_TITLE, f"Transcripción completada.\n\nArchivos guardados en:\n{Path(txt_path).parent}")
 
     def on_error(self, error_message):
@@ -1074,6 +1500,111 @@ class App(tk.Tk):
         self.set_status("Ocurrió un error.")
         self.log(error_message)
         messagebox.showerror(APP_TITLE, f"Error durante la transcripción:\n\n{error_message[:500]}")
+
+    # ---------------------------------------------------------------
+    # Traducción (paso aparte, usa lo ya transcrito)
+    # ---------------------------------------------------------------
+    def _parse_current_transcript_segments(self):
+        """Convierte el contenido actual del panel (líneas '[HH:MM:SS --> HH:MM:SS] texto')
+        en una lista de dicts {start, end, text}, para poder traducirlo."""
+        import re
+
+        def hms_to_seconds(ts):
+            parts = [float(p) for p in ts.split(":")]
+            while len(parts) < 3:
+                parts.insert(0, 0.0)
+            h, m, s = parts
+            return h * 3600 + m * 60 + s
+
+        pattern = re.compile(r"^\[(.+?) --> (.+?)\] (.*)$")
+        content = self.transcript_text.get("1.0", "end")
+        segments = []
+        for line in content.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            match = pattern.match(line)
+            if match:
+                start_s, end_s, text = match.group(1), match.group(2), match.group(3)
+                segments.append({
+                    "start": hms_to_seconds(start_s),
+                    "end": hms_to_seconds(end_s),
+                    "text": text.strip(),
+                })
+        return segments
+
+    def start_translate_to_english(self):
+        if not self._translation_cache:
+            messagebox.showwarning(APP_TITLE, "Primero transcribe un archivo.")
+            return
+        self.btn_translate_en.set_enabled(False)
+        self.btn_translate_es.set_enabled(False)
+        self.btn_run.set_enabled(False)
+        self.update_progress(0)
+        self.set_status("Iniciando traducción al inglés...")
+
+        c = self._translation_cache
+        worker = TranslateToEnglishWorker(
+            audio_array=c["audio_array"], sr=c["sr"], device=c["device"],
+            model_size=c["model_size"], out_dir=self.out_dir.get(), base_name=c["base_name"],
+            on_status=lambda msg: self.after(0, self.set_status, msg),
+            on_segment=lambda text, start, end: self.after(0, self.append_segment, text, start, end),
+            on_progress_pct=lambda pct: self.after(0, self.update_progress, pct),
+            on_done=lambda txt, srt, plain: self.after(0, self.on_translation_done, "inglés", txt, srt, plain),
+            on_error=lambda err: self.after(0, self.on_translation_error, err),
+            on_clear=lambda: self.after(0, lambda: self.transcript_text.delete("1.0", "end")),
+        )
+        worker.start()
+
+    def start_translate_to_spanish(self):
+        segments = self._parse_current_transcript_segments()
+        if not segments:
+            messagebox.showwarning(
+                APP_TITLE, "No hay texto en el panel para traducir todavía."
+            )
+            return
+        base_name = (self._translation_cache or {}).get("base_name")
+        if not base_name and self._last_paths:
+            base_name = Path(self._last_paths[0]).stem.replace("_transcripcion", "")
+        base_name = base_name or "transcripcion"
+
+        self.btn_translate_en.set_enabled(False)
+        self.btn_translate_es.set_enabled(False)
+        self.btn_run.set_enabled(False)
+        self.update_progress(0)
+        self.set_status("Iniciando traducción al español...")
+
+        worker = TranslateToSpanishWorker(
+            segments=segments, out_dir=self.out_dir.get(), base_name=base_name,
+            on_status=lambda msg: self.after(0, self.set_status, msg),
+            on_segment=lambda text, start, end: self.after(0, self.append_segment, text, start, end),
+            on_progress_pct=lambda pct: self.after(0, self.update_progress, pct),
+            on_done=lambda txt, srt, plain: self.after(0, self.on_translation_done, "español", txt, srt, plain),
+            on_error=lambda err: self.after(0, self.on_translation_error, err),
+            on_clear=lambda: self.after(0, lambda: self.transcript_text.delete("1.0", "end")),
+        )
+        worker.start()
+
+    def on_translation_done(self, lang_label, txt_path, srt_path, plain_path):
+        self.btn_run.set_enabled(True)
+        self.btn_translate_en.set_enabled(True)
+        self.btn_translate_es.set_enabled(True)
+        self.set_status(f"¡Traducción al {lang_label} completada!")
+        self.log(f"TXT ({lang_label}): {txt_path}")
+        self.log(f"SRT ({lang_label}): {srt_path}")
+        self.log(f"TXT plano ({lang_label}): {plain_path}")
+        messagebox.showinfo(
+            APP_TITLE,
+            f"Traducción al {lang_label} completada.\n\nArchivos guardados en:\n{Path(txt_path).parent}",
+        )
+
+    def on_translation_error(self, error_message):
+        self.btn_run.set_enabled(True)
+        self.btn_translate_en.set_enabled(True)
+        self.btn_translate_es.set_enabled(True)
+        self.set_status("Ocurrió un error durante la traducción.")
+        self.log(error_message)
+        messagebox.showerror(APP_TITLE, f"Error durante la traducción:\n\n{error_message[:500]}")
 
     def save_edited_transcript(self):
         if not self._last_paths:
