@@ -71,6 +71,12 @@ def get_base_dir():
 
 CONFIG_FILENAME = "config_transcriptor.json"
 
+# Factor de escala DPI real de la pantalla, calculado una vez al arrancar
+# la app (ver App.__init__). RoundedButton lo lee de acá para que TODOS
+# los botones escalen su tamaño en píxeles, sin tener que tocar cada
+# lugar donde se crean.
+_dpi_scale_holder = {"value": 1.0}
+
 
 def load_app_config():
     try:
@@ -1039,6 +1045,9 @@ class WebsiteTranslateWorker(threading.Thread):
 class RoundedButton(tk.Canvas):
     def __init__(self, parent, text, command, colors, panel_bg,
                  width=150, height=36, use_accent=True, **kwargs):
+        scale = _dpi_scale_holder["value"]
+        width = int(width * scale)
+        height = int(height * scale)
         super().__init__(parent, width=width, height=height, bg=panel_bg,
                           highlightthickness=0, **kwargs)
         self.command = command
@@ -1099,15 +1108,20 @@ class App(tk.Tk):
         # Con la ventana ya reconocida como DPI-aware por Windows, hay que
         # decirle a Tk el factor de escala real de la pantalla, o los
         # textos/widgets quedarían diminutos en monitores de alta densidad.
+        # Ese mismo factor hay que aplicarlo también al TAMAÑO en píxeles
+        # de todas las ventanas (principal y emergentes), o el contenido
+        # ya escalado no entra en marcos que quedaron con tamaño fijo.
+        self.dpi_scale = 1.0
         try:
-            dpi_scale = self.winfo_fpixels("1i") / 72.0
-            self.tk.call("tk", "scaling", dpi_scale)
+            self.dpi_scale = self.winfo_fpixels("1i") / 72.0
+            self.tk.call("tk", "scaling", self.dpi_scale)
         except Exception:
             pass
+        _dpi_scale_holder["value"] = self.dpi_scale
 
         self.title(APP_TITLE)
-        self.geometry("1150x720")
-        self.minsize(900, 560)
+        self.geometry(self._scaled_geom(1150, 720))
+        self.minsize(*self._scaled_size(900, 560))
 
         self.theme_name = "dark"
         self.colors = DARK
@@ -1183,6 +1197,13 @@ class App(tk.Tk):
         self.destroy()
 
     # ---------------------------------------------------------------
+    def _scaled_size(self, w, h):
+        return int(w * self.dpi_scale), int(h * self.dpi_scale)
+
+    def _scaled_geom(self, w, h):
+        sw, sh = self._scaled_size(w, h)
+        return f"{sw}x{sh}"
+
     def _card(self, parent):
         outer = tk.Frame(parent, bg=self.colors["border"])
         inner = tk.Frame(outer, bg=self.colors["panel"])
@@ -2205,8 +2226,8 @@ class App(tk.Tk):
         win = tk.Toplevel(self)
         win.title("Seleccionar pista de audio")
         win.configure(bg=c["bg"])
-        win.geometry("480x360")
-        win.minsize(420, 300)
+        win.geometry(self._scaled_geom(480, 360))
+        win.minsize(*self._scaled_size(420, 300))
         win.transient(self)
         win.grab_set()
 
@@ -2482,8 +2503,8 @@ class App(tk.Tk):
         win = tk.Toplevel(self)
         win.title("Gestor de modelos")
         win.configure(bg=c["bg"])
-        win.geometry("560x460")
-        win.minsize(500, 380)
+        win.geometry(self._scaled_geom(560, 460))
+        win.minsize(*self._scaled_size(500, 380))
         win.transient(self)
 
         tk.Label(win, text="Modelos disponibles", bg=c["bg"], fg=c["text"],
