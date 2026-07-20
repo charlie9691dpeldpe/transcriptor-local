@@ -7,6 +7,7 @@ instalados por separado en el sistema.
 
 import os
 import math
+import json
 import sys
 import threading
 import traceback
@@ -58,6 +59,35 @@ DARK = {
     "accent_hover": "#E08863", "track": "#3D3B36", "surface": "#3A3935",
     "log_bg": "#211F1C", "btn_disabled": "#5A5852",
 }
+
+
+def get_base_dir():
+    """Carpeta donde vive el .exe (o el script, en modo desarrollo).
+    Ahí mismo se guardan modelos y la configuración persistente."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).resolve().parent
+
+
+CONFIG_FILENAME = "config_transcriptor.json"
+
+
+def load_app_config():
+    try:
+        path = get_base_dir() / CONFIG_FILENAME
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def save_app_config(data):
+    try:
+        path = get_base_dir() / CONFIG_FILENAME
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def format_timestamp_srt(seconds: float) -> str:
@@ -687,19 +717,27 @@ class TextDocumentTranslateWorker(threading.Thread):
 
 class WebsiteDownloaderWorker(threading.Thread):
     """Descarga las páginas HTML de un sitio (mismo dominio), siguiendo
-    enlaces internos, hasta un límite de páginas. Solo HTML por ahora
-    (no imágenes/CSS/JS) -- pensado para poder traducir el contenido."""
+    enlaces internos hasta cierta profundidad y cantidad máxima de
+    páginas. También descarga imágenes, CSS, JS y los recursos
+    referenciados dentro del propio CSS (fuentes, fondos, etc. vía
+    url()), y reescribe TODOS los enlaces (entre páginas y a recursos)
+    para que apunten a las copias locales -- así el sitio descargado
+    funciona completamente sin conexión a internet."""
 
-    def __init__(self, start_url, out_dir, page_limit,
+    ASSET_TAGS = [("img", "src"), ("script", "src"), ("link", "href"), ("source", "src")]
+
+    def __init__(self, start_url, out_dir, page_limit, max_depth,
                  on_status, on_progress_pct, on_done, on_error):
         super().__init__(daemon=True)
         self.start_url = start_url
         self.out_dir = out_dir
         self.page_limit = max(1, page_limit)
+        self.max_depth = max(0, max_depth)
         self.on_status = on_status
         self.on_progress_pct = on_progress_pct
         self.on_done = on_done
         self.on_error = on_error
+        self._asset_cache = {}
 
     @staticmethod
     def _url_to_local_path(url, base_dir):
@@ -711,6 +749,52 @@ class WebsiteDownloaderWorker(threading.Thread):
         if not os.path.splitext(path)[1]:
             path = path + ".html"
         return Path(base_dir) / parsed.netloc / path.lstrip("/")
+
+    def _download_asset(self, asset_url, out_dir, headers, requests_module):
+        if asset_url in self._asset_cache:
+            return self._asset_cache[asset_url]
+        try:
+            resp = requests_module.get(asset_url, headers=headers, timeout=15)
+            resp.raise_for_status()
+            local_path = self._url_to_local_path(asset_url, out_dir)
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_bytes(resp.content)
+            self._asset_cache[asset_url] = local_path
+            return local_path
+        except Exception:
+            self._asset_cache[asset_url] = None
+            return None
+
+    def _process_css_urls(self, css_path, css_url, out_dir, headers, requests_module):
+        """Busca url(...) dentro de un CSS ya descargado (fuentes, fondos,
+        íconos), descarga esos recursos también, y reescribe las rutas
+        para que queden apuntando a las copias locales."""
+        import re
+        from urllib.parse import urljoin
+
+        try:
+            text = css_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return
+
+        pattern = re.compile(r'url\(\s*[\'"]?([^\'")]+)[\'"]?\s*\)')
+
+        def replace(match):
+            ref = match.group(1)
+            if ref.startswith("data:"):
+                return match.group(0)
+            abs_url = urljoin(css_url, ref)
+            sub_local = self._download_asset(abs_url, out_dir, headers, requests_module)
+            if sub_local:
+                rel = os.path.relpath(sub_local, start=css_path.parent)
+                return f'url("{rel.replace(os.sep, "/")}")'
+            return match.group(0)
+
+        try:
+            new_text = pattern.sub(replace, text)
+            css_path.write_text(new_text, encoding="utf-8")
+        except Exception:
+            pass
 
     def run(self):
         try:
@@ -729,18 +813,21 @@ class WebsiteDownloaderWorker(threading.Thread):
             out_dir.mkdir(parents=True, exist_ok=True)
 
             visited = set()
-            queue = [start_url]
+            queue = [(start_url, 0)]
+            queued = {start_url}
             saved_count = 0
+            asset_count = 0
             headers = {"User-Agent": "Mozilla/5.0 (compatible; TranscriptorLocalBot/1.0)"}
 
             while queue and saved_count < self.page_limit:
-                url = queue.pop(0)
+                url, depth = queue.pop(0)
                 if url in visited:
                     continue
                 visited.add(url)
 
                 self.on_status(
-                    f"Descargando página {saved_count + 1} de {self.page_limit}: {url}"
+                    f"Descargando página {saved_count + 1} de {self.page_limit} "
+                    f"(profundidad {depth}): {url}"
                 )
                 try:
                     resp = requests.get(url, headers=headers, timeout=15)
@@ -755,22 +842,67 @@ class WebsiteDownloaderWorker(threading.Thread):
 
                 local_path = self._url_to_local_path(url, out_dir)
                 local_path.parent.mkdir(parents=True, exist_ok=True)
-                local_path.write_bytes(resp.content)
-                saved_count += 1
-
-                pct = min(100, int(saved_count / self.page_limit * 100))
-                self.on_progress_pct(pct)
 
                 try:
                     soup = BeautifulSoup(resp.content, "html.parser")
+                except Exception:
+                    soup = None
+
+                if soup is not None:
+                    # Recursos: imágenes, CSS, JS, íconos
+                    for tag_name, attr in self.ASSET_TAGS:
+                        for tag in soup.find_all(tag_name):
+                            is_stylesheet = False
+                            if tag_name == "link":
+                                rel = tag.get("rel") or []
+                                rel_str = " ".join(rel)
+                                if "stylesheet" not in rel_str and "icon" not in rel_str:
+                                    continue
+                                is_stylesheet = "stylesheet" in rel_str
+                            asset_ref = tag.get(attr)
+                            if not asset_ref or asset_ref.startswith("data:"):
+                                continue
+                            asset_url = urljoin(url, asset_ref)
+                            self.on_status(f"Descargando recurso: {asset_url}")
+                            asset_local = self._download_asset(asset_url, out_dir, headers, requests)
+                            if asset_local:
+                                asset_count += 1
+                                if is_stylesheet:
+                                    self._process_css_urls(asset_local, asset_url, out_dir, headers, requests)
+                                rel_path = os.path.relpath(asset_local, start=local_path.parent)
+                                tag[attr] = rel_path.replace(os.sep, "/")
+
+                    # Enlaces entre páginas: SIEMPRE se reescriben a la ruta
+                    # local (para que la navegación funcione offline), y
+                    # solo se agregan a la cola si no exceden la
+                    # profundidad/límite configurados.
                     for a in soup.find_all("a", href=True):
                         link = urljoin(url, a["href"])
-                        link = urlparse(link)._replace(fragment="").geturl()
-                        if urlparse(link).netloc == domain and link not in visited:
-                            queue.append(link)
-                except Exception:
-                    pass
+                        link_clean = urlparse(link)._replace(fragment="").geturl()
+                        if urlparse(link_clean).netloc != domain:
+                            continue  # enlaces externos quedan como están
 
+                        target_local = self._url_to_local_path(link_clean, out_dir)
+                        rel_path = os.path.relpath(target_local, start=local_path.parent)
+                        a["href"] = rel_path.replace(os.sep, "/")
+
+                        if (
+                            link_clean not in queued
+                            and depth < self.max_depth
+                            and len(queued) < self.page_limit * 3
+                        ):
+                            queue.append((link_clean, depth + 1))
+                            queued.add(link_clean)
+
+                    local_path.write_text(str(soup), encoding="utf-8")
+                else:
+                    local_path.write_bytes(resp.content)
+
+                saved_count += 1
+                pct = min(100, int(saved_count / self.page_limit * 100))
+                self.on_progress_pct(pct)
+
+            self.on_status(f"Listo: {saved_count} página(s) y {asset_count} recurso(s) descargados.")
             self.on_progress_pct(100)
             self.on_done(saved_count, str(out_dir))
         except Exception as e:
@@ -956,8 +1088,15 @@ class App(tk.Tk):
         self.theme_name = "dark"
         self.colors = DARK
 
+        # Carpetas de salida: se recuerdan entre sesiones (archivo de
+        # configuración junto al .exe), una por cada sección de la app.
+        self._config = load_app_config()
+        default_base = Path.home() / "TranscriptorLocal"
+
         self.filepath = tk.StringVar()
-        self.out_dir = tk.StringVar(value=str(Path.home() / "Transcripciones"))
+        self.out_dir = tk.StringVar(
+            value=self._config.get("transcription_out_dir") or str(default_base / "Transcripcion")
+        )
         self.model_size = tk.StringVar(value="large-v3")
         self.language_label = tk.StringVar(value="Detectar automáticamente")
         self.use_gpu = tk.BooleanVar(value=True)
@@ -969,10 +1108,19 @@ class App(tk.Tk):
         self._translation_cache = None
         self.doc_progress_pct = tk.IntVar(value=0)
         self.doc_filepath = tk.StringVar()
+        self.doc_out_dir = tk.StringVar(
+            value=self._config.get("translation_out_dir") or str(default_base / "Traduccion")
+        )
         self.website_url = tk.StringVar()
-        self.website_out_dir = tk.StringVar(value=str(Path.home() / "SitiosDescargados"))
+        self.website_out_dir = tk.StringVar(
+            value=self._config.get("website_download_out_dir") or str(default_base / "Sitio web")
+        )
         self.website_page_limit = tk.StringVar(value="50")
+        self.website_depth = tk.StringVar(value="3")
         self.website_translate_dir = tk.StringVar()
+        self.website_translate_out_dir = tk.StringVar(
+            value=self._config.get("website_translate_out_dir") or str(default_base / "Sitio web")
+        )
         self.website_progress_pct = tk.IntVar(value=0)
 
         # Registro de widgets "planos" (no-ttk) que hay que retematizar
@@ -995,6 +1143,19 @@ class App(tk.Tk):
 
         self._build_ui()
         self._apply_theme()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _save_config(self):
+        save_app_config({
+            "transcription_out_dir": self.out_dir.get(),
+            "translation_out_dir": self.doc_out_dir.get(),
+            "website_download_out_dir": self.website_out_dir.get(),
+            "website_translate_out_dir": self.website_translate_out_dir.get(),
+        })
+
+    def _on_close(self):
+        self._save_config()
+        self.destroy()
 
     # ---------------------------------------------------------------
     def _card(self, parent):
@@ -1375,8 +1536,19 @@ class App(tk.Tk):
         )
         self.doc_load_hint.pack(anchor="w", padx=16, pady=(4, 16))
 
+        doc_field_label("Carpeta de salida")
+        doc_out_row = self._panel_frame(right_card)
+        doc_out_row.pack(fill="x", padx=16)
+        doc_out_entry = ttk.Entry(doc_out_row, textvariable=self.doc_out_dir)
+        doc_out_entry.pack(side="left", fill="x", expand=True, ipady=3)
+        self._add_entry_context_menu(doc_out_entry)
+        b_doc_out = RoundedButton(doc_out_row, "Elegir", self.pick_doc_out_dir,
+                                   self.colors, self.colors["panel"], width=100, height=30)
+        b_doc_out.pack(side="left", padx=(8, 0))
+        self._round_buttons_accent.append(b_doc_out)
+
         doc_btn_col = self._panel_frame(right_card)
-        doc_btn_col.pack(fill="x", padx=16, pady=(0, 10))
+        doc_btn_col.pack(fill="x", padx=16, pady=(16, 10))
 
         self.btn_doc_translate_en = RoundedButton(
             doc_btn_col, "Traducir a inglés", lambda: self.start_document_translation("en"),
@@ -1444,6 +1616,17 @@ class App(tk.Tk):
         self.doc_text.insert("1.0", content)
         self.doc_status_var.set(f"Documento cargado: {Path(path).name}")
 
+        # Por defecto, guardar el resultado en una subcarpeta al lado
+        # del archivo original elegido.
+        self.doc_out_dir.set(str(Path(path).parent / "Traduccion"))
+        self._save_config()
+
+    def pick_doc_out_dir(self):
+        path = filedialog.askdirectory(title="Selecciona carpeta de salida")
+        if path:
+            self.doc_out_dir.set(path)
+            self._save_config()
+
     def start_document_translation(self, target_lang):
         text = self.doc_text.get("1.0", "end").strip()
         if not text:
@@ -1451,13 +1634,14 @@ class App(tk.Tk):
             return
 
         base_name = Path(self.doc_filepath.get()).stem if self.doc_filepath.get() else "documento"
-        out_dir = self.out_dir.get() or str(Path.home() / "Transcripciones")
+        out_dir = self.doc_out_dir.get() or str(Path.home() / "TranscriptorLocal" / "Traduccion")
 
         self.btn_doc_translate_en.set_enabled(False)
         self.btn_doc_translate_es.set_enabled(False)
         self.doc_progress_pct.set(0)
         self.doc_pct_label.configure(text="0%")
         self.doc_status_var.set("Iniciando traducción...")
+        self._save_config()
 
         worker = TextDocumentTranslateWorker(
             text=text, target_lang=target_lang, out_dir=out_dir, base_name=base_name,
@@ -1555,6 +1739,18 @@ class App(tk.Tk):
         limit_entry.pack(side="left")
         self._add_entry_context_menu(limit_entry)
 
+        depth_row = self._panel_frame(dl_card)
+        depth_row.pack(fill="x", padx=16, pady=4)
+        tk.Label(depth_row, text="Profundidad:", bg=self.colors["panel"], fg=self.colors["text"],
+                 font=(FONT_FAMILY, 10), width=14, anchor="w").pack(side="left")
+        depth_entry = ttk.Entry(depth_row, textvariable=self.website_depth, width=10)
+        depth_entry.pack(side="left")
+        self._add_entry_context_menu(depth_entry)
+        tk.Label(
+            depth_row, text="  (0 = solo esta página, 1 = + sus enlaces, 2 = + los enlaces de esos, etc.)",
+            bg=self.colors["panel"], fg=self.colors["text_muted"], font=(FONT_FAMILY, 8)
+        ).pack(side="left")
+
         dl_btn_row = self._panel_frame(dl_card)
         dl_btn_row.pack(fill="x", padx=16, pady=(10, 6))
         self.btn_website_download = RoundedButton(
@@ -1613,6 +1809,18 @@ class App(tk.Tk):
         b_trdir.pack(side="left", padx=(8, 0))
         self._round_buttons_accent.append(b_trdir)
 
+        trout_row = self._panel_frame(tr_card)
+        trout_row.pack(fill="x", padx=16, pady=4)
+        tk.Label(trout_row, text="Carpeta de salida:", bg=self.colors["panel"], fg=self.colors["text"],
+                 font=(FONT_FAMILY, 10), width=14, anchor="w").pack(side="left")
+        trout_entry = ttk.Entry(trout_row, textvariable=self.website_translate_out_dir)
+        trout_entry.pack(side="left", fill="x", expand=True)
+        self._add_entry_context_menu(trout_entry)
+        b_trout = RoundedButton(trout_row, "Elegir", self.pick_website_translate_out_dir,
+                                 self.colors, self.colors["panel"], width=90, height=28)
+        b_trout.pack(side="left", padx=(8, 0))
+        self._round_buttons_accent.append(b_trout)
+
         tr_btn_row = self._panel_frame(tr_card)
         tr_btn_row.pack(fill="x", padx=16, pady=(10, 6))
         self.btn_website_translate_en = RoundedButton(
@@ -1656,11 +1864,21 @@ class App(tk.Tk):
         path = filedialog.askdirectory(title="Selecciona carpeta de destino")
         if path:
             self.website_out_dir.set(path)
+            self._save_config()
 
     def pick_website_translate_dir(self):
         path = filedialog.askdirectory(title="Selecciona la carpeta del sitio a traducir")
         if path:
             self.website_translate_dir.set(path)
+            # Por defecto, la traducción se guarda al lado de esa carpeta.
+            self.website_translate_out_dir.set(str(Path(path).parent / "Sitio web"))
+            self._save_config()
+
+    def pick_website_translate_out_dir(self):
+        path = filedialog.askdirectory(title="Selecciona carpeta de salida para la traducción")
+        if path:
+            self.website_translate_out_dir.set(path)
+            self._save_config()
 
     def start_website_download(self):
         url = self.website_url.get().strip()
@@ -1672,14 +1890,21 @@ class App(tk.Tk):
         except ValueError:
             messagebox.showwarning(APP_TITLE, "El máximo de páginas debe ser un número.")
             return
+        try:
+            max_depth = int(self.website_depth.get().strip())
+        except ValueError:
+            messagebox.showwarning(APP_TITLE, "La profundidad debe ser un número.")
+            return
 
         self.btn_website_download.set_enabled(False)
         self.website_progress_pct.set(0)
         self.website_dl_pct_label.configure(text="0%")
         self.website_dl_status_var.set("Iniciando descarga...")
+        self._save_config()
 
         worker = WebsiteDownloaderWorker(
             start_url=url, out_dir=self.website_out_dir.get(), page_limit=page_limit,
+            max_depth=max_depth,
             on_status=lambda msg: self.after(0, self._update_website_dl_status, msg),
             on_progress_pct=lambda pct: self.after(0, self._update_website_dl_progress, pct),
             on_done=lambda count, out_dir: self.after(0, self.on_website_download_done, count, out_dir),
@@ -1698,6 +1923,8 @@ class App(tk.Tk):
         self.btn_website_download.set_enabled(True)
         self.website_dl_status_var.set(f"¡Listo! Se descargaron {count} página(s) en: {out_dir}")
         self.website_translate_dir.set(out_dir)
+        self.website_translate_out_dir.set(str(Path(out_dir).parent / "Sitio web"))
+        self._save_config()
         messagebox.showinfo(APP_TITLE, f"Se descargaron {count} página(s).\n\nGuardadas en:\n{out_dir}")
 
     def on_website_download_error(self, error_message):
@@ -1716,10 +1943,11 @@ class App(tk.Tk):
         self.website_tr_progress_var.set(0)
         self.website_tr_pct_label.configure(text="0%")
         self.website_tr_status_var.set("Iniciando traducción del sitio...")
+        self._save_config()
 
         worker = WebsiteTranslateWorker(
             site_dir=site_dir, target_lang=target_lang,
-            out_dir=self.website_out_dir.get() or str(Path.home() / "SitiosDescargados"),
+            out_dir=self.website_translate_out_dir.get() or str(Path.home() / "TranscriptorLocal" / "Sitio web"),
             on_status=lambda msg: self.after(0, self._update_website_tr_status, msg),
             on_progress_pct=lambda pct: self.after(0, self._update_website_tr_progress, pct),
             on_done=lambda count, out_dir: self.after(0, self.on_website_translation_done, count, out_dir),
@@ -1896,6 +2124,10 @@ class App(tk.Tk):
             self.selected_audio_track = None
             self.audio_tracks_info = probe_audio_tracks(path)
             self._refresh_track_indicator()
+            # Por defecto, guardar el resultado en una subcarpeta al lado
+            # del archivo original elegido.
+            self.out_dir.set(str(Path(path).parent / "Transcripcion"))
+            self._save_config()
             if len(self.audio_tracks_info) > 1:
                 self.open_track_selector()
 
@@ -1950,6 +2182,7 @@ class App(tk.Tk):
         path = filedialog.askdirectory(title="Selecciona carpeta de salida")
         if path:
             self.out_dir.set(path)
+            self._save_config()
 
     def log(self, message: str):
         self.log_text.configure(state="normal")
@@ -1988,6 +2221,7 @@ class App(tk.Tk):
         self.set_status("Iniciando...")
         self._last_paths = None
         self._translation_cache = None
+        self._save_config()
 
         language = LANGUAGE_MAP.get(self.language_label.get())
 
