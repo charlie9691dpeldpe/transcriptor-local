@@ -639,10 +639,12 @@ class TranslateToSpanishWorker(threading.Thread):
 
 class TextDocumentTranslateWorker(threading.Thread):
     """Traduce un documento de texto cualquiera (no producido por la
-    transcripción), de forma independiente. target_lang: 'en' o 'es'."""
+    transcripción), de forma independiente. target_lang: 'en' o 'es'.
+    Si srt_entries viene con datos, la salida se guarda como .srt
+    conservando índices y tiempos originales; si no, como .txt plano."""
 
     def __init__(self, text, target_lang, out_dir, base_name,
-                 on_status, on_progress_pct, on_done, on_error):
+                 on_status, on_progress_pct, on_done, on_error, srt_entries=None):
         super().__init__(daemon=True)
         self.text = text
         self.target_lang = target_lang
@@ -652,6 +654,7 @@ class TextDocumentTranslateWorker(threading.Thread):
         self.on_progress_pct = on_progress_pct
         self.on_done = on_done
         self.on_error = on_error
+        self.srt_entries = srt_entries
 
     def run(self):
         try:
@@ -680,32 +683,53 @@ class TextDocumentTranslateWorker(threading.Thread):
             if device == "cuda":
                 model = model.to("cuda")
 
-            lines = [l for l in self.text.splitlines() if l.strip()]
-            if not lines:
-                lines = [self.text.strip()]
-
-            translated_lines = []
-            batch_size = 16
-            total = len(lines)
-
-            for i in range(0, total, batch_size):
-                batch = lines[i:i + batch_size]
-                self.on_status(f"Traduciendo línea {i + len(batch)} de {total}...")
-                inputs = tok(batch, return_tensors="pt", padding=True, truncation=True)
-                if device == "cuda":
-                    inputs = {k: v.to("cuda") for k, v in inputs.items()}
-                with torch.no_grad():
-                    generated = model.generate(**inputs, max_length=512)
-                translated_lines.extend(
-                    tok.decode(t, skip_special_tokens=True).strip() for t in generated
-                )
-                self.on_progress_pct(min(100, int((i + len(batch)) / total * 100)))
-
-            translated_text = "\n".join(translated_lines)
+            def translate_lines(lines):
+                translated = []
+                batch_size = 16
+                total = len(lines)
+                for i in range(0, total, batch_size):
+                    batch = lines[i:i + batch_size]
+                    self.on_status(f"Traduciendo línea {i + len(batch)} de {total}...")
+                    inputs = tok(batch, return_tensors="pt", padding=True, truncation=True)
+                    if device == "cuda":
+                        inputs = {k: v.to("cuda") for k, v in inputs.items()}
+                    with torch.no_grad():
+                        generated = model.generate(**inputs, max_length=512)
+                    translated.extend(
+                        tok.decode(t, skip_special_tokens=True).strip() for t in generated
+                    )
+                    self.on_progress_pct(min(100, int((i + len(batch)) / total * 100)))
+                return translated
 
             out_dir = Path(self.out_dir)
             out_dir.mkdir(parents=True, exist_ok=True)
             suffix = "ingles" if self.target_lang == "en" else "espanol"
+
+            if self.srt_entries:
+                # ---- Formato de entrada: .srt -> salida: .srt ----
+                original_texts = [e["text"] for e in self.srt_entries]
+                translated_texts = translate_lines(original_texts)
+
+                srt_blocks = []
+                for i, (entry, new_text) in enumerate(zip(self.srt_entries, translated_texts), start=1):
+                    srt_blocks.append(f"{i}\n{entry['start']} --> {entry['end']}\n{new_text}\n")
+
+                out_path = out_dir / f"{self.base_name}_traducido_{suffix}.srt"
+                out_path.write_text("\n".join(srt_blocks), encoding="utf-8")
+
+                display_text = "\n".join(translated_texts)
+                self.on_progress_pct(100)
+                self.on_done(display_text, str(out_path))
+                return
+
+            # ---- Formato de entrada: .txt/.md/texto pegado -> salida: .txt ----
+            lines = [l for l in self.text.splitlines() if l.strip()]
+            if not lines:
+                lines = [self.text.strip()]
+
+            translated_lines = translate_lines(lines)
+            translated_text = "\n".join(translated_lines)
+
             out_path = out_dir / f"{self.base_name}_traducido_{suffix}.txt"
             out_path.write_text(translated_text, encoding="utf-8")
 
@@ -1108,6 +1132,7 @@ class App(tk.Tk):
         self._translation_cache = None
         self.doc_progress_pct = tk.IntVar(value=0)
         self.doc_filepath = tk.StringVar()
+        self.doc_srt_entries = None
         self.doc_out_dir = tk.StringVar(
             value=self._config.get("translation_out_dir") or str(default_base / "Traduccion")
         )
@@ -1584,6 +1609,33 @@ class App(tk.Tk):
         paned.add(right_outer, weight=2)
         return paned
 
+    @staticmethod
+    def _parse_srt(raw):
+        """Parsea un .srt en una lista de dicts {start, end, text}."""
+        import re
+        blocks = re.split(r"\n\s*\n", raw.strip())
+        entries = []
+        ts_re = re.compile(r"(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})")
+        for block in blocks:
+            lines = [l for l in block.splitlines() if l.strip() != ""]
+            if not lines:
+                continue
+            ts_line_idx = None
+            for i, line in enumerate(lines):
+                if "-->" in line:
+                    ts_line_idx = i
+                    break
+            if ts_line_idx is None:
+                continue
+            match = ts_re.search(lines[ts_line_idx])
+            if not match:
+                continue
+            start_str = match.group(1).replace(".", ",")
+            end_str = match.group(2).replace(".", ",")
+            text = " ".join(lines[ts_line_idx + 1:]).strip()
+            entries.append({"start": start_str, "end": end_str, "text": text})
+        return entries
+
     def load_document_for_translation(self):
         path = filedialog.askopenfilename(
             title="Selecciona un documento de texto",
@@ -1600,21 +1652,22 @@ class App(tk.Tk):
             messagebox.showerror(APP_TITLE, f"No se pudo leer el archivo:\n\n{e}")
             return
 
+        self.doc_srt_entries = None
         if path.lower().endswith(".srt"):
-            lines = []
-            for line in raw.splitlines():
-                stripped = line.strip()
-                if not stripped or stripped.isdigit() or "-->" in stripped:
-                    continue
-                lines.append(stripped)
-            content = "\n".join(lines)
+            entries = self._parse_srt(raw)
+            if entries:
+                self.doc_srt_entries = entries
+                content = "\n".join(e["text"] for e in entries)
+            else:
+                content = raw
         else:
             content = raw
 
         self.doc_filepath.set(path)
         self.doc_text.delete("1.0", "end")
         self.doc_text.insert("1.0", content)
-        self.doc_status_var.set(f"Documento cargado: {Path(path).name}")
+        fmt_note = " (formato .srt detectado, se conserva al traducir)" if self.doc_srt_entries else ""
+        self.doc_status_var.set(f"Documento cargado: {Path(path).name}{fmt_note}")
 
         # Por defecto, guardar el resultado en una subcarpeta al lado
         # del archivo original elegido.
@@ -1636,6 +1689,21 @@ class App(tk.Tk):
         base_name = Path(self.doc_filepath.get()).stem if self.doc_filepath.get() else "documento"
         out_dir = self.doc_out_dir.get() or str(Path.home() / "TranscriptorLocal" / "Traduccion")
 
+        # Si el documento venía de un .srt y la cantidad de líneas no
+        # cambió (el usuario no agregó/quitó líneas al editar), se puede
+        # reconstruir el .srt con los mismos tiempos y el texto actual.
+        srt_entries = None
+        current_lines = [l for l in text.splitlines() if l.strip()]
+        if self.doc_srt_entries and len(self.doc_srt_entries) == len(current_lines):
+            srt_entries = [
+                {"start": e["start"], "end": e["end"], "text": new_text}
+                for e, new_text in zip(self.doc_srt_entries, current_lines)
+            ]
+        elif self.doc_srt_entries:
+            self.doc_status_var.set(
+                "Aviso: la cantidad de líneas cambió, se guardará como .txt en vez de .srt."
+            )
+
         self.btn_doc_translate_en.set_enabled(False)
         self.btn_doc_translate_es.set_enabled(False)
         self.doc_progress_pct.set(0)
@@ -1645,6 +1713,7 @@ class App(tk.Tk):
 
         worker = TextDocumentTranslateWorker(
             text=text, target_lang=target_lang, out_dir=out_dir, base_name=base_name,
+            srt_entries=srt_entries,
             on_status=lambda msg: self.after(0, self.doc_status_var.set, msg),
             on_progress_pct=lambda pct: self.after(0, self._update_doc_progress, pct),
             on_done=lambda translated_text, out_path: self.after(
