@@ -746,23 +746,38 @@ class TextDocumentTranslateWorker(threading.Thread):
 
 
 class WebsiteDownloaderWorker(threading.Thread):
-    """Descarga las páginas HTML de un sitio (mismo dominio), siguiendo
-    enlaces internos hasta cierta profundidad y cantidad máxima de
-    páginas. También descarga imágenes, CSS, JS y los recursos
-    referenciados dentro del propio CSS (fuentes, fondos, etc. vía
-    url()), y reescribe TODOS los enlaces (entre páginas y a recursos)
-    para que apunten a las copias locales -- así el sitio descargado
-    funciona completamente sin conexión a internet."""
+    """Descarga un sitio completo por niveles: descarga la página inicial,
+    luego TODAS las páginas a las que apuntan sus enlaces, luego todas
+    las que apuntan esas, y así hasta la profundidad indicada (o sin
+    límite, si se pide descargar el sitio en su totalidad) -- SIN
+    restringirse al dominio inicial: si un enlace lleva a otro sitio
+    (por ejemplo, un enlace a un servicio de nube externo), ese sitio
+    también se descarga. CSS y JS se descargan siempre (necesarios para
+    que la página funcione); imágenes y videos son opcionales por
+    separado. Al terminar guarda un archivo de metadatos en la carpeta
+    de destino para poder "actualizar" la descarga más adelante."""
 
-    ASSET_TAGS = [("img", "src"), ("script", "src"), ("link", "href"), ("source", "src")]
+    ASSET_TAGS = [("img", "src"), ("script", "src"), ("link", "href"),
+                  ("source", "src"), ("video", "src")]
+    # Extensiones de video comunes, para reconocer <a href="...mp4"> sueltos
+    VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".avi", ".mkv", ".m4v")
+    METADATA_FILENAME = "_sitio_info.json"
+    # Freno de seguridad interno (no configurable) para evitar que un
+    # sitio enorme deje la descarga corriendo por horas sin fin. No
+    # debería alcanzarse en un uso normal.
+    HARD_SAFETY_LIMIT = 5000
 
-    def __init__(self, start_url, out_dir, page_limit, max_depth,
+    def __init__(self, start_url, out_dir, max_depth, unlimited_depth,
+                 download_images, download_videos, follow_external,
                  on_status, on_progress_pct, on_done, on_error):
         super().__init__(daemon=True)
         self.start_url = start_url
         self.out_dir = out_dir
-        self.page_limit = max(1, page_limit)
         self.max_depth = max(0, max_depth)
+        self.unlimited_depth = unlimited_depth
+        self.download_images = download_images
+        self.download_videos = download_videos
+        self.follow_external = follow_external
         self.on_status = on_status
         self.on_progress_pct = on_progress_pct
         self.on_done = on_done
@@ -784,7 +799,7 @@ class WebsiteDownloaderWorker(threading.Thread):
         if asset_url in self._asset_cache:
             return self._asset_cache[asset_url]
         try:
-            resp = requests_module.get(asset_url, headers=headers, timeout=15)
+            resp = requests_module.get(asset_url, headers=headers, timeout=20)
             resp.raise_for_status()
             local_path = self._url_to_local_path(asset_url, out_dir)
             local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -826,6 +841,23 @@ class WebsiteDownloaderWorker(threading.Thread):
         except Exception:
             pass
 
+    def _asset_category_allowed(self, tag_name, tag):
+        """Decide si un recurso debe descargarse según las casillas de
+        fotos/videos. CSS, JS e íconos siempre se descargan (necesarios
+        para que el sitio funcione)."""
+        if tag_name in ("script", "link"):
+            return True
+        if tag_name == "img":
+            return self.download_images
+        if tag_name == "video":
+            return self.download_videos
+        if tag_name == "source":
+            parent_name = tag.parent.name if tag.parent else ""
+            if parent_name == "video":
+                return self.download_videos
+            return self.download_images  # <picture><source> = imagen responsiva
+        return True
+
     def run(self):
         try:
             import requests
@@ -849,15 +881,17 @@ class WebsiteDownloaderWorker(threading.Thread):
             asset_count = 0
             headers = {"User-Agent": "Mozilla/5.0 (compatible; TranscriptorLocalBot/1.0)"}
 
-            while queue and saved_count < self.page_limit:
+            depth_label = "sin límite" if self.unlimited_depth else str(self.max_depth)
+
+            while queue and saved_count < self.HARD_SAFETY_LIMIT:
                 url, depth = queue.pop(0)
                 if url in visited:
                     continue
                 visited.add(url)
 
                 self.on_status(
-                    f"Descargando página {saved_count + 1} de {self.page_limit} "
-                    f"(profundidad {depth}): {url}"
+                    f"Descargando (nivel {depth} de {depth_label}), "
+                    f"página #{saved_count + 1}: {url}"
                 )
                 try:
                     resp = requests.get(url, headers=headers, timeout=15)
@@ -879,7 +913,7 @@ class WebsiteDownloaderWorker(threading.Thread):
                     soup = None
 
                 if soup is not None:
-                    # Recursos: imágenes, CSS, JS, íconos
+                    # Recursos: imágenes, CSS, JS, íconos, video
                     for tag_name, attr in self.ASSET_TAGS:
                         for tag in soup.find_all(tag_name):
                             is_stylesheet = False
@@ -889,6 +923,8 @@ class WebsiteDownloaderWorker(threading.Thread):
                                 if "stylesheet" not in rel_str and "icon" not in rel_str:
                                     continue
                                 is_stylesheet = "stylesheet" in rel_str
+                            if not self._asset_category_allowed(tag_name, tag):
+                                continue
                             asset_ref = tag.get(attr)
                             if not asset_ref or asset_ref.startswith("data:"):
                                 continue
@@ -902,24 +938,42 @@ class WebsiteDownloaderWorker(threading.Thread):
                                 rel_path = os.path.relpath(asset_local, start=local_path.parent)
                                 tag[attr] = rel_path.replace(os.sep, "/")
 
-                    # Enlaces entre páginas: SIEMPRE se reescriben a la ruta
-                    # local (para que la navegación funcione offline), y
-                    # solo se agregan a la cola si no exceden la
-                    # profundidad/límite configurados.
+                    # Enlaces entre páginas: se reescriben a ruta local
+                    # SOLO si se van a descargar. Si el enlace es a otro
+                    # dominio y "follow_external" está desactivado, se deja
+                    # apuntando a la URL real de internet (no se descarga).
                     for a in soup.find_all("a", href=True):
                         link = urljoin(url, a["href"])
                         link_clean = urlparse(link)._replace(fragment="").geturl()
-                        if urlparse(link_clean).netloc != domain:
-                            continue  # enlaces externos quedan como están
+                        parsed_link = urlparse(link_clean)
+                        if parsed_link.scheme not in ("http", "https"):
+                            continue  # ignora mailto:, tel:, javascript:, etc.
+
+                        is_external = parsed_link.netloc != domain
+                        if is_external and not self.follow_external:
+                            continue  # se deja el enlace tal cual, sin descargar
+
+                        # Un <a href="...mp4"> suelto (no dentro de <video>)
+                        # también cuenta como recurso de video.
+                        if parsed_link.path.lower().endswith(self.VIDEO_EXTENSIONS):
+                            if self.download_videos:
+                                self.on_status(f"Descargando video: {link_clean}")
+                                asset_local = self._download_asset(link_clean, out_dir, headers, requests)
+                                if asset_local:
+                                    asset_count += 1
+                                    rel_path = os.path.relpath(asset_local, start=local_path.parent)
+                                    a["href"] = rel_path.replace(os.sep, "/")
+                            continue
 
                         target_local = self._url_to_local_path(link_clean, out_dir)
                         rel_path = os.path.relpath(target_local, start=local_path.parent)
                         a["href"] = rel_path.replace(os.sep, "/")
 
+                        within_depth = self.unlimited_depth or depth < self.max_depth
                         if (
                             link_clean not in queued
-                            and depth < self.max_depth
-                            and len(queued) < self.page_limit * 3
+                            and within_depth
+                            and len(queued) < self.HARD_SAFETY_LIMIT
                         ):
                             queue.append((link_clean, depth + 1))
                             queued.add(link_clean)
@@ -929,8 +983,27 @@ class WebsiteDownloaderWorker(threading.Thread):
                     local_path.write_bytes(resp.content)
 
                 saved_count += 1
-                pct = min(100, int(saved_count / self.page_limit * 100))
-                self.on_progress_pct(pct)
+                if self.unlimited_depth:
+                    self.on_progress_pct(min(99, saved_count))  # sin total conocido
+                else:
+                    pct = min(100, int((depth / max(1, self.max_depth)) * 100)) if self.max_depth else 100
+                    self.on_progress_pct(pct)
+
+            # Metadatos para poder "actualizar" esta descarga más adelante
+            try:
+                metadata = {
+                    "start_url": self.start_url,
+                    "max_depth": self.max_depth,
+                    "unlimited_depth": self.unlimited_depth,
+                    "download_images": self.download_images,
+                    "download_videos": self.download_videos,
+                    "follow_external": self.follow_external,
+                }
+                (out_dir / self.METADATA_FILENAME).write_text(
+                    json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+            except Exception:
+                pass
 
             self.on_status(f"Listo: {saved_count} página(s) y {asset_count} recurso(s) descargados.")
             self.on_progress_pct(100)
@@ -1154,8 +1227,11 @@ class App(tk.Tk):
         self.website_out_dir = tk.StringVar(
             value=self._config.get("website_download_out_dir") or str(default_base / "Sitio web")
         )
-        self.website_page_limit = tk.StringVar(value="50")
         self.website_depth = tk.StringVar(value="3")
+        self.website_unlimited_depth = tk.BooleanVar(value=False)
+        self.website_download_images = tk.BooleanVar(value=True)
+        self.website_download_videos = tk.BooleanVar(value=True)
+        self.website_follow_external = tk.BooleanVar(value=False)
         self.website_translate_dir = tk.StringVar()
         self.website_translate_out_dir = tk.StringVar(
             value=self._config.get("website_translate_out_dir") or str(default_base / "Sitio web")
@@ -1511,7 +1587,7 @@ class App(tk.Tk):
 
         self.doc_hint_label = tk.Label(
             left_card,
-            text="Cargá un archivo o pegá/escribí texto directamente acá. Editable con Ctrl+Z y clic derecho.",
+            text="Carga un archivo o pega/escribe texto directamente aquí. Editable con Ctrl+Z y clic derecho.",
             bg=self.colors["panel"], fg=self.colors["text_muted"], font=(FONT_FAMILY, 9)
         )
         self.doc_hint_label.pack(anchor="w", padx=16, pady=(0, 6))
@@ -1576,7 +1652,7 @@ class App(tk.Tk):
 
         self.doc_load_hint = tk.Label(
             right_card,
-            text="No hace falta cargar un archivo: también podés pegar o escribir texto directo en el panel de la izquierda.",
+            text="No hace falta cargar un archivo: también puedes pegar o escribir texto directo en el panel de la izquierda.",
             bg=self.colors["panel"], fg=self.colors["text_muted"], font=(FONT_FAMILY, 8),
             wraplength=290, justify="left"
         )
@@ -1704,7 +1780,7 @@ class App(tk.Tk):
     def start_document_translation(self, target_lang):
         text = self.doc_text.get("1.0", "end").strip()
         if not text:
-            messagebox.showwarning(APP_TITLE, "Cargá un documento o escribí/pegá texto primero.")
+            messagebox.showwarning(APP_TITLE, "Carga un documento o escribe/pega texto primero.")
             return
 
         base_name = Path(self.doc_filepath.get()).stem if self.doc_filepath.get() else "documento"
@@ -1821,14 +1897,6 @@ class App(tk.Tk):
         b_dlout.pack(side="left", padx=(8, 0))
         self._round_buttons_accent.append(b_dlout)
 
-        limit_row = self._panel_frame(dl_card)
-        limit_row.pack(fill="x", padx=16, pady=4)
-        tk.Label(limit_row, text="Máx. de páginas:", bg=self.colors["panel"], fg=self.colors["text"],
-                 font=(FONT_FAMILY, 10), width=14, anchor="w").pack(side="left")
-        limit_entry = ttk.Entry(limit_row, textvariable=self.website_page_limit, width=10)
-        limit_entry.pack(side="left")
-        self._add_entry_context_menu(limit_entry)
-
         depth_row = self._panel_frame(dl_card)
         depth_row.pack(fill="x", padx=16, pady=4)
         tk.Label(depth_row, text="Profundidad:", bg=self.colors["panel"], fg=self.colors["text"],
@@ -1836,10 +1904,52 @@ class App(tk.Tk):
         depth_entry = ttk.Entry(depth_row, textvariable=self.website_depth, width=10)
         depth_entry.pack(side="left")
         self._add_entry_context_menu(depth_entry)
+
+        depth_hint_row = self._panel_frame(dl_card)
+        depth_hint_row.pack(fill="x", padx=16, pady=(0, 4))
         tk.Label(
-            depth_row, text="  (0 = solo esta página, 1 = + sus enlaces, 2 = + los enlaces de esos, etc.)",
-            bg=self.colors["panel"], fg=self.colors["text_muted"], font=(FONT_FAMILY, 8)
+            depth_hint_row,
+            text=("0 = solo esta página. 1 = + todas las páginas a las que apuntan sus enlaces. "
+                  "2 = + todas las páginas a las que apuntan esas, y así sucesivamente. Esto "
+                  "incluye enlaces a OTROS sitios web distintos (por ejemplo, enlaces a un "
+                  "servicio de nube externo) -- también se descargan, respetando la misma "
+                  "profundidad. Cuidado: valores altos pueden descargar miles de páginas de "
+                  "varios sitios y tardar mucho tiempo."),
+            bg=self.colors["panel"], fg=self.colors["text_muted"], font=(FONT_FAMILY, 8),
+            wraplength=700, justify="left"
+        ).pack(anchor="w")
+
+        unlimited_row = self._panel_frame(dl_card)
+        unlimited_row.pack(fill="x", padx=16, pady=(8, 4))
+        ttk.Checkbutton(
+            unlimited_row, text="Descargar el sitio en su totalidad (ignora la profundidad de arriba)",
+            variable=self.website_unlimited_depth
+        ).pack(anchor="w")
+
+        external_row = self._panel_frame(dl_card)
+        external_row.pack(fill="x", padx=16, pady=(4, 4))
+        ttk.Checkbutton(
+            external_row,
+            text="Descargar también sitios externos a los que lleven los enlaces (no solo el sitio original)",
+            variable=self.website_follow_external
+        ).pack(anchor="w")
+        tk.Label(
+            external_row,
+            text=("Desactivado: los enlaces a otros sitios quedan tal cual, apuntando a internet, "
+                  "sin descargarse. Activado: esos otros sitios también se descargan, con la misma "
+                  "profundidad configurada."),
+            bg=self.colors["panel"], fg=self.colors["text_muted"], font=(FONT_FAMILY, 8),
+            wraplength=700, justify="left"
+        ).pack(anchor="w")
+
+        assets_row = self._panel_frame(dl_card)
+        assets_row.pack(fill="x", padx=16, pady=(4, 4))
+        ttk.Checkbutton(
+            assets_row, text="Descargar fotos", variable=self.website_download_images
         ).pack(side="left")
+        ttk.Checkbutton(
+            assets_row, text="Descargar videos", variable=self.website_download_videos
+        ).pack(side="left", padx=(24, 0))
 
         dl_btn_row = self._panel_frame(dl_card)
         dl_btn_row.pack(fill="x", padx=16, pady=(10, 6))
@@ -1849,6 +1959,13 @@ class App(tk.Tk):
         )
         self.btn_website_download.pack(side="left")
         self._round_buttons_accent.append(self.btn_website_download)
+
+        self.btn_website_update = RoundedButton(
+            dl_btn_row, "Actualizar sitio ya descargado", self.update_downloaded_website,
+            self.colors, self.colors["panel"], width=220, height=36, use_accent=False
+        )
+        self.btn_website_update.pack(side="left", padx=(8, 0))
+        self._round_buttons_plain_panel.append(self.btn_website_update)
 
         self.website_dl_pct_label = tk.Label(
             dl_btn_row, text="0%", bg=self.colors["panel"], fg=self.colors["accent"],
@@ -1881,7 +1998,7 @@ class App(tk.Tk):
         self.website_tr_title.pack(anchor="w", padx=16, pady=(14, 4))
         self.website_tr_hint = tk.Label(
             tr_card,
-            text="Elegí la carpeta de un sitio ya descargado (con esta app u otra herramienta) y traducí su contenido.",
+            text="Elige la carpeta de un sitio ya descargado (con esta app u otra herramienta) y traduce su contenido.",
             bg=self.colors["panel"], fg=self.colors["text_muted"], font=(FONT_FAMILY, 8),
             wraplength=700, justify="left"
         )
@@ -1973,12 +2090,7 @@ class App(tk.Tk):
     def start_website_download(self):
         url = self.website_url.get().strip()
         if not url:
-            messagebox.showwarning(APP_TITLE, "Escribí primero la URL del sitio.")
-            return
-        try:
-            page_limit = int(self.website_page_limit.get().strip())
-        except ValueError:
-            messagebox.showwarning(APP_TITLE, "El máximo de páginas debe ser un número.")
+            messagebox.showwarning(APP_TITLE, "Escribe primero la URL del sitio.")
             return
         try:
             max_depth = int(self.website_depth.get().strip())
@@ -1987,20 +2099,65 @@ class App(tk.Tk):
             return
 
         self.btn_website_download.set_enabled(False)
+        self.btn_website_update.set_enabled(False)
         self.website_progress_pct.set(0)
         self.website_dl_pct_label.configure(text="0%")
         self.website_dl_status_var.set("Iniciando descarga...")
         self._save_config()
 
         worker = WebsiteDownloaderWorker(
-            start_url=url, out_dir=self.website_out_dir.get(), page_limit=page_limit,
+            start_url=url, out_dir=self.website_out_dir.get(),
             max_depth=max_depth,
+            unlimited_depth=self.website_unlimited_depth.get(),
+            download_images=self.website_download_images.get(),
+            download_videos=self.website_download_videos.get(),
+            follow_external=self.website_follow_external.get(),
             on_status=lambda msg: self.after(0, self._update_website_dl_status, msg),
             on_progress_pct=lambda pct: self.after(0, self._update_website_dl_progress, pct),
             on_done=lambda count, out_dir: self.after(0, self.on_website_download_done, count, out_dir),
             on_error=lambda err: self.after(0, self.on_website_download_error, err),
         )
         worker.start()
+
+    def update_downloaded_website(self):
+        """Vuelve a descargar un sitio ya bajado antes, usando la URL y
+        configuración que se guardaron la última vez, comparándolo/
+        sobrescribiéndolo con lo que haya actualmente en línea."""
+        folder = filedialog.askdirectory(title="Selecciona la carpeta del sitio ya descargado")
+        if not folder:
+            return
+
+        meta_path = Path(folder) / WebsiteDownloaderWorker.METADATA_FILENAME
+        if not meta_path.exists():
+            messagebox.showwarning(
+                APP_TITLE,
+                "Esa carpeta no tiene información guardada de una descarga previa "
+                "(fue descargada con una versión anterior de la app, o no es una "
+                "carpeta de sitio descargado). Podés configurar los campos de "
+                "arriba a mano y usar 'Descargar sitio' en su lugar.",
+            )
+            return
+
+        try:
+            metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, f"No se pudo leer la información del sitio:\n\n{e}")
+            return
+
+        self.website_url.set(metadata.get("start_url", ""))
+        self.website_out_dir.set(folder)
+        self.website_depth.set(str(metadata.get("max_depth", 3)))
+        self.website_unlimited_depth.set(bool(metadata.get("unlimited_depth", False)))
+        self.website_download_images.set(bool(metadata.get("download_images", True)))
+        self.website_download_videos.set(bool(metadata.get("download_videos", True)))
+        self.website_follow_external.set(bool(metadata.get("follow_external", False)))
+        self._save_config()
+
+        self.website_dl_status_var.set(
+            f"Actualizando sitio (misma configuración que la descarga anterior): "
+            f"{metadata.get('start_url', '')}"
+        )
+        self.start_website_download()
 
     def _update_website_dl_status(self, msg):
         self.website_dl_status_var.set(msg)
@@ -2011,6 +2168,7 @@ class App(tk.Tk):
 
     def on_website_download_done(self, count, out_dir):
         self.btn_website_download.set_enabled(True)
+        self.btn_website_update.set_enabled(True)
         self.website_dl_status_var.set(f"¡Listo! Se descargaron {count} página(s) en: {out_dir}")
         self.website_translate_dir.set(out_dir)
         self.website_translate_out_dir.set(str(Path(out_dir).parent / "Sitio web"))
@@ -2019,13 +2177,14 @@ class App(tk.Tk):
 
     def on_website_download_error(self, error_message):
         self.btn_website_download.set_enabled(True)
+        self.btn_website_update.set_enabled(True)
         self.website_dl_status_var.set("Ocurrió un error durante la descarga.")
         messagebox.showerror(APP_TITLE, f"Error al descargar el sitio:\n\n{error_message[:500]}")
 
     def start_website_translation(self, target_lang):
         site_dir = self.website_translate_dir.get().strip()
         if not site_dir or not os.path.isdir(site_dir):
-            messagebox.showwarning(APP_TITLE, "Elegí una carpeta válida de un sitio ya descargado.")
+            messagebox.showwarning(APP_TITLE, "Elige una carpeta válida de un sitio ya descargado.")
             return
 
         self.btn_website_translate_en.set_enabled(False)
